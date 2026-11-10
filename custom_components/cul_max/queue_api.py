@@ -62,14 +62,14 @@ def register_queue_services(hass) -> None:
                 ids = data.get("entry_ids") or [data["entry_id"]]
                 removed, protected = [], []
                 for entry_id in ids:
-                    owner = next((c for c in controllers.values() if entry_id in c._command_queue.entries), None)
+                    owner = next((c for c in controllers.values() if c.has_queue_entry(entry_id)), None)
                     if owner is None:
                         if len(ids) == 1:
                             raise ValueError("Queue-Eintrag nicht mehr vorhanden")
                         protected.append({"id": entry_id, "reason": "Nicht mehr vorhanden"})
                         continue
                     try:
-                        owner._command_queue.delete(entry_id)
+                        owner.delete_queue_entry(entry_id)
                         removed.append(entry_id)
                     except ValueError as err:
                         if len(ids) == 1:
@@ -79,7 +79,7 @@ def register_queue_services(hass) -> None:
             else:
                 coordinator = select_controller(controllers, data.get("config_entry_id"))
                 if call.service == "clear_queue":
-                    result = coordinator._command_queue.clear(data.get("address"))
+                    result = coordinator.clear_queue(data.get("address"))
                 else:
                     result = await coordinator.async_cancel_config_job(data["job_id"], confirm=data["confirm"])
             return result if call.return_response else None

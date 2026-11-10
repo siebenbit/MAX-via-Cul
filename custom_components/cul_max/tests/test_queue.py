@@ -17,7 +17,9 @@ api = importlib.import_module("_cul_budget_tests.queue_api")
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
-    asyncSetUp = transport.CreditTests.asyncSetUp
+    async def asyncSetUp(self):
+        await transport.CreditTests.asyncSetUp(self)
+        self.c._temperature_debounce_seconds = 0.0
     asyncTearDown = transport.CreditTests.asyncTearDown
     attach = transport.CreditTests.attach
     send = transport.CreditTests.send
@@ -62,6 +64,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_devices_and_other_command_types_are_independent(self):
         a = self.temperature(20)
         b = self.temperature(19, "234567")
+        await self.settle()
         time_cmd = protocol.build_time_information(4, self.c.own_address, 0x123456)
         time_task = asyncio.create_task(self.c._send_command(time_cmd, expected_src=None,
             device_address="123456", counter=None, description="TimeInformation"))

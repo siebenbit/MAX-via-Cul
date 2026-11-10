@@ -124,7 +124,10 @@ class CulMaxClimate(ClimateEntity):
         self._attr_available = False
 
     def _raw_mode(self) -> int:
-        """Return the last raw MAX! mode, defaulting conservatively to manual."""
+        """Return the desired mode while pending, otherwise the reported mode."""
+        intent = self._coordinator.get_temperature_intent(self._address)
+        if intent is not None and intent.overlay:
+            return intent.mode
         if self._state is not None:
             return self._state.mode
         last = self._device.last_state or {}
@@ -133,6 +136,9 @@ class CulMaxClimate(ClimateEntity):
 
     def _temperature_write_mode(self) -> int:
         """Choose a SetTemperature mode that preserves the current operating style."""
+        intent = self._coordinator.get_temperature_intent(self._address)
+        if intent is not None and intent.overlay:
+            return intent.mode
         raw_mode = self._raw_mode()
         if raw_mode in (MODE_AUTO, MODE_VACATION):
             return MODE_AUTO
@@ -145,6 +151,9 @@ class CulMaxClimate(ClimateEntity):
         self.async_on_remove(
             self._coordinator.add_week_profile_listener(self._address, self._on_week_profile_update)
         )
+        self.async_on_remove(
+            self._coordinator.add_temperature_listener(self._address, self._on_temperature_intent)
+        )
         # Restore last known state if available
         last = self._device.last_state
         if last:
@@ -156,9 +165,24 @@ class CulMaxClimate(ClimateEntity):
         if decoded is None:
             return
         self._state = decoded
+        self._coordinator.temperature_report_received(self._address)
         self._apply_state_dict(decoded.__dict__)
         self._attr_available = True
         self.async_write_ha_state()
+
+    @callback
+    def _on_temperature_intent(self) -> None:
+        reported = self._state.__dict__ if self._state is not None else self._device.last_state or {}
+        self._apply_state_dict(reported)
+        self.async_write_ha_state()
+
+    def _apply_desired_temperature(self) -> None:
+        intent = self._coordinator.get_temperature_intent(self._address)
+        if intent is not None and intent.overlay:
+            if intent.display_temperature is not None:
+                self._attr_target_temperature = intent.display_temperature
+            self._attr_hvac_mode = HVAC_MODE_MAP.get(intent.mode, HVACMode.HEAT)
+            self._attr_preset_mode = "boost" if intent.mode == MODE_BOOST else None
 
     @callback
     def _on_week_profile_update(self) -> None:
@@ -173,6 +197,7 @@ class CulMaxClimate(ClimateEntity):
         self._attr_hvac_mode = HVAC_MODE_MAP.get(mode, HVACMode.HEAT)
         self._attr_preset_mode = "boost" if mode == MODE_BOOST else None
 
+        self._apply_desired_temperature()
         valve = state.get("valve_position", 0)
         if self._attr_hvac_mode == HVACMode.OFF:
             self._attr_hvac_action = HVACAction.IDLE
@@ -247,6 +272,13 @@ class CulMaxClimate(ClimateEntity):
                 attrs["until"] = self._state.until
             if self._state.boost_duration is not None:
                 attrs["boost_duration_min"] = self._state.boost_duration
+        intent = self._coordinator.get_temperature_intent(self._address)
+        reported = self._state.__dict__ if self._state is not None else self._device.last_state or {}
+        attrs.update({
+            "requested_target_temperature": intent.display_temperature if intent else None,
+            "reported_target_temperature": reported.get("desired_temperature"),
+            "temperature_command_status": intent.entry.status if intent else None,
+        })
         return attrs
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -254,14 +286,11 @@ class CulMaxClimate(ClimateEntity):
         if temperature is None:
             return
         mode = self._temperature_write_mode()
-        result = await self._coordinator.async_set_temperature(
-            self._address, temperature, mode=mode
+        intent = self._coordinator.get_temperature_intent(self._address)
+        until = intent.until if intent and intent.overlay and mode == MODE_VACATION else None
+        await self._coordinator.async_set_temperature(
+            self._address, temperature, mode=mode, until=until,
         )
-        if result.status != "completed":
-            return
-        self._attr_target_temperature = temperature
-        self._attr_hvac_mode = HVAC_MODE_MAP.get(mode, HVACMode.HEAT)
-        self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:

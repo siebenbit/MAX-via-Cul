@@ -5,12 +5,13 @@ import vm from "node:vm";
 
 function setup() {
   const elements = new Map();
+  const timers = new Map();
   class Element {
     constructor() { this.isConnected = true; }
     attachShadow() { this.shadowRoot = { innerHTML: "", querySelector: () => null, querySelectorAll: () => [] }; }
     querySelectorAll() { return []; }
   }
-  const context = vm.createContext({ HTMLElement: Element, window: { confirm: () => true },
+  const context = vm.createContext({ HTMLElement: Element, window: { confirm: () => true, setInterval: (callback) => { const id = timers.size + 1; timers.set(id, callback); return id; }, clearInterval: (id) => timers.delete(id) },
     customElements: { get: (key) => elements.get(key), define: (key, value) => elements.set(key, value) },
     document: { createElement: (name) => new (elements.get(name))() }, CustomEvent: class {}, console });
   vm.runInContext(readFileSync(new URL("../../frontend/cul-max-queue-card.js", import.meta.url), "utf8"), context);
@@ -24,7 +25,7 @@ function setup() {
   const hass = { connection, states: {}, callWS: async (call) => { calls.push(call); return { response: { controllers: [controller] } }; } };
   card.setConfig({ title: "MAX! Warteschlange" });
   card.hass = hass;
-  return { card, controller, hass, calls, listeners, elements };
+  return { card, controller, hass, calls, listeners, elements, timers };
 }
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 
@@ -98,4 +99,25 @@ test("editor exposes title, controller, device, status and scope", () => {
   editor.setConfig({ title: "My queue" });
   for (const key of ["title", "config_entry_id", "address", "status", "scope"])
     assert.match(editor.innerHTML, new RegExp(`data-key="${key}"`));
+});
+
+
+test("debouncing is visible, cancellable and counts down locally without polling", async () => {
+  const { card, controller, timers, calls } = setup();
+  await tick();
+  controller.entries.push({ id: "debounce", scope: "general", device_address: "ABCDEF",
+    device_name: "Bad", description: "SetTemperature 23 °C", command_type: "SetTemperature",
+    status: "debouncing", cancellable: true, attempts: 0,
+    debounce_until: new Date(Date.now() + 2000).toISOString() });
+  card._render();
+  assert.match(card.shadowRoot.innerHTML, /Wird gesammelt/);
+  assert.match(card.shadowRoot.innerHTML, /Wartend: 1/);
+  assert.match(card.shadowRoot.innerHTML, /data-delete="debounce"/);
+  assert.equal(timers.size, 1);
+  const previous = calls.length;
+  for (const callback of timers.values()) callback();
+  await tick();
+  assert.equal(calls.length, previous);
+  card.disconnectedCallback();
+  assert.equal(timers.size, 0);
 });

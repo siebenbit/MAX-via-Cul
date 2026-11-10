@@ -246,3 +246,6 @@ changes. Unsent temperature/mode changes for the same device use latest-value-wi
 See the [English queue guide](custom_components/cul_max/README.en.md#inspecting-and-controlling-the-transmission-queue)
 or [German queue guide](custom_components/cul_max/README.md#sendewarteschlange-verwalten)
 for actions, installation, cancellation limits and simulation tests.
+
+Version 0.1.3 additionally collects temperature/mode changes for two seconds per
+thermostat while immediately displaying the desired target in Home Assistant.

@@ -1,5 +1,6 @@
 /* Queue UI uses HA service responses and the queue sensor's revision signal. */
 const queueStatuses = {
+  debouncing: "Wird gesammelt",
   queued: "Wartet", waiting_for_credits: "Wartet auf Credits", sending: "Wird gesendet",
   awaiting_ack: "Wartet auf ACK", retrying: "Wiederholungsversuch", completed: "Abgeschlossen",
   failed: "Fehlgeschlagen", cancelled: "Abgebrochen", superseded: "Ersetzt", cancelling: "Wird abgebrochen",
@@ -57,6 +58,23 @@ class CulMaxQueueCard extends HTMLElement {
     this._attached?.removeEventListener("ready", this._onReady);
     this._attached?.removeEventListener("disconnected", this._onDisconnected);
     this._attached = null;
+    this._stopCountdown();
+  }
+  _stopCountdown() {
+    if (this._countdownTimer !== undefined) window.clearInterval(this._countdownTimer);
+    this._countdownTimer = undefined;
+  }
+  _syncCountdown(items) {
+    if (!this.isConnected || !items.some((item) => item.status === "debouncing")) {
+      this._stopCountdown();
+      return;
+    }
+    const update = () => this.shadowRoot.querySelectorAll("[data-debounce-until]").forEach((node) => {
+      const remaining = Math.max(0, (Date.parse(node.dataset.debounceUntil) - Date.now()) / 1000);
+      node.textContent = `${remaining.toFixed(1)} s`;
+    });
+    update();
+    if (this._countdownTimer === undefined) this._countdownTimer = window.setInterval(update, 100);
   }
   getCardSize() { return 5; }
 
@@ -126,7 +144,7 @@ class CulMaxQueueCard extends HTMLElement {
     const h = escapeQueueText;
     const controller = this._controller();
     const items = this._items();
-    const waiting = items.filter((item) => ["queued", "waiting_for_credits"].includes(item.status)).length;
+    const waiting = items.filter((item) => ["debouncing", "queued", "waiting_for_credits"].includes(item.status)).length;
     const active = items.filter((item) => ["sending", "awaiting_ack", "retrying", "cancelling"].includes(item.status)).length;
     const credits = controller?.budget;
     this.shadowRoot.innerHTML = `
@@ -153,7 +171,7 @@ class CulMaxQueueCard extends HTMLElement {
         const description = item.description.replace(/^SetTemperature /, "Solltemperatur → ");
         const created = item.created_at ? new Date(item.created_at).toLocaleString("de-DE") : "unbekannt";
         return `<div class="row"><div class="body"><div class="device">${item.cancellable ? `<input type="checkbox" aria-label="${h(item.device_name)} auswählen" data-select="${h(item.id)}" ${this._selected.has(item.id) ? "checked" : ""}> ` : ""}${h(item.device_name || item.device_address)}</div>
-          <div class="description">${h(description)}</div><div>${h(queueStatuses[item.status] || item.status)}</div>
+          <div class="description">${h(description)}</div><div>${h(queueStatuses[item.status] || item.status)}${item.status === "debouncing" ? ` · <span data-debounce-until="${h(item.debounce_until)}"></span>` : ""}</div>
           <div class="muted">${h(item.command_type)} · Erstellt: ${h(created)} · Versuche: ${h(item.attempts)}</div>
           ${isJob ? `<div class="muted">${item.completed_steps?.length || 0} / ${item.steps?.length || 0} Schritte übertragen · ${item.confirmed_steps?.length || 0} bestätigt</div>` : ""}
           ${item.last_error ? `<div class="error">${h(item.last_error)}</div>` : ""}
@@ -162,6 +180,7 @@ class CulMaxQueueCard extends HTMLElement {
       }).join("") || `<div class="notice">${controller ? "Keine wartenden Aufträge" : this._data ? "Controller auswählen" : "Warteschlange wird geladen …"}</div>`}</div>
       <div class="actions"><button id="clear" ${!controller || this._busy || !items.some((item) => item.cancellable) ? "disabled" : ""}>Wartende Befehle leeren</button>
       <button id="delete-selected" ${!this._selected.size || this._busy ? "disabled" : ""}>Auswahl löschen (${this._selected.size})</button></div></ha-card>`;
+    this._syncCountdown(items);
     this.shadowRoot.querySelector("#reload")?.addEventListener("click", () => this._refresh());
     this.shadowRoot.querySelector("#controller")?.addEventListener("change", (event) => { this._controllerId = event.target.value; this._selected.clear(); this._render(); });
     this.shadowRoot.querySelectorAll("[data-select]").forEach((box) => box.addEventListener("change", () => { box.checked ? this._selected.add(box.dataset.select) : this._selected.delete(box.dataset.select); this._render(); }));

@@ -54,6 +54,9 @@ class QueueEntry:
     last_error: str | None = None
     has_been_sent: bool = False
     stop: asyncio.Event = field(default_factory=asyncio.Event)
+    ready_task: asyncio.Future | None = None
+    ready_deadline: float | None = None
+    ready_callback: Callable | None = None
 
     @property
     def cancellable(self) -> bool:
@@ -72,13 +75,15 @@ class QueueEntry:
 class CommandQueueManager:
     """All mutations are synchronous on HA's event loop; no private Queue access."""
 
-    def __init__(self, changed: Callable[[], None], capacity: int = 256):
+    def __init__(self, changed: Callable[[], None], capacity: int = 256, *, now=None):
         self._entries: OrderedDict[str, QueueEntry] = OrderedDict()
         self.history: deque[dict] = deque(maxlen=50)
         self._pending: OrderedDict[str, QueueEntry] = OrderedDict()
         self._ready = asyncio.Event()
         self.changed = changed
         self.capacity = capacity
+        self.now = now or (lambda: asyncio.get_running_loop().time())
+        self.external_count = lambda: 0
         self.superseded_count = 0
         self.cancelled_count = 0
         self.last_error: str | None = None
@@ -100,22 +105,44 @@ class CommandQueueManager:
                 if old.replace_key == entry.replace_key and old.cancellable:
                     _LOGGER.debug("Queue: Replaced %s → %s", old.description, entry.description)
                     self.finish(old, "superseded")
-        if len(self._entries) >= self.capacity:
+        if len(self._entries) + self.external_count() >= self.capacity:
             self.last_error = "Sendewarteschlange ist voll"
             self.notify()
             raise ValueError(self.last_error)
         self._entries[entry.id] = entry
         if worker:
             self._pending[entry.id] = entry
+            if entry.ready_task is not None:
+                entry.ready_callback = lambda _: self._ready.set()
+                entry.ready_task.add_done_callback(entry.ready_callback)
             self._ready.set()
         self.notify()
 
     async def get(self):
-        while not self._pending:
+        while True:
             self._ready.clear()
-            await self._ready.wait()
-        _, entry = self._pending.popitem(last=False)
-        return entry.payload
+            now = self.now()
+            deadlines = []
+            for key, entry in self._pending.items():
+                if (entry.ready_task is None or entry.ready_task.done()
+                        or entry.ready_deadline is None or now >= entry.ready_deadline):
+                    self._pending.pop(key)
+                    self._remove_readiness_callback(entry)
+                    return entry.payload
+                deadlines.append(entry.ready_deadline)
+            if not deadlines:
+                await self._ready.wait()
+            else:
+                try:
+                    await asyncio.wait_for(self._ready.wait(), max(0, min(deadlines) - now))
+                except TimeoutError:
+                    pass
+
+    def _remove_readiness_callback(self, entry: QueueEntry) -> None:
+        if entry.ready_task is not None and entry.ready_callback is not None:
+            entry.ready_task.remove_done_callback(entry.ready_callback)
+            entry.ready_callback = None
+        entry.ready_task = None
 
     def qsize(self) -> int:
         return len(self._pending)
@@ -146,6 +173,7 @@ class CommandQueueManager:
     def finish(self, entry: QueueEntry, status: str, *, ack=None, error=None) -> None:
         if entry.status in TERMINAL:
             return
+        self._remove_readiness_callback(entry)
         entry.status = status
         _LOGGER.debug("Queue: %s %s (%s)", status, entry.description, entry.id)
         entry.last_error = str(error) if error else entry.last_error

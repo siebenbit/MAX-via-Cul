@@ -68,7 +68,7 @@ class CulMaxQueueSensor(SensorEntity):
 
     @property
     def native_value(self):
-        return self._coordinator._command_queue.snapshot()["waiting"]
+        return self._coordinator.get_queue()["waiting"]
 
     @property
     def extra_state_attributes(self):

@@ -86,6 +86,7 @@ RECONNECT_DELAY_MIN = 5   # seconds before first reconnect attempt
 RECONNECT_DELAY_MAX = 60  # upper bound for exponential backoff
 ACK_TIMEOUT = 3.0
 ACK_RETRIES = 2
+TEMPERATURE_DEBOUNCE_SECONDS = 2.0
 SET_TEMPERATURE_ACK_TIMEOUT = 5.0
 SET_TEMPERATURE_ACK_RETRIES = 4
 CONFIG_ACK_TIMEOUT = 8.0
@@ -198,6 +199,23 @@ class CommandRequest:
     timeout: float
     future: asyncio.Future[CommandResult]
     entry: QueueEntry | None = None
+
+
+@dataclass
+class TemperatureIntent:
+    """A complete desired state; no RF command exists until its deadline."""
+    address: str
+    temperature: float
+    mode: int
+    until: datetime | None
+    generation: int
+    deadline: float
+    entry: QueueEntry
+    display_temperature: float | None
+    configuration_task: asyncio.Future | None = None
+    configuration_deadline: float | None = None
+    task: asyncio.Task | None = None
+    overlay: bool = True
 
 
 @dataclass
@@ -391,7 +409,14 @@ class CulMaxCoordinator:
         self._pending_queue_task: asyncio.Task | None = None
         self._auto_mode_time_sync_tasks: dict[str, asyncio.Task] = {}
         self._queue_listeners: list[Callable[[], None]] = []
-        self._command_queue = CommandQueueManager(self._queue_changed)
+        self._command_queue = CommandQueueManager(self._queue_changed, now=self.hass.loop.time)
+        self._temperature_debounce_seconds = TEMPERATURE_DEBOUNCE_SECONDS
+        self._debounce_intents: dict[str, TemperatureIntent] = {}
+        self._desired_temperatures: dict[str, TemperatureIntent] = {}
+        self._temperature_tasks: set[asyncio.Task] = set()
+        self._temperature_listeners: dict[str, list[Callable[[], None]]] = {}
+        self._temperature_published: dict[str, tuple] = {}
+        self._command_queue.external_count = lambda: len(self._debounce_intents)
         self._config_jobs: dict[str, dict[str, Any]] = {}
         self._storage_lock = asyncio.Lock()
         self._temperature_generation: dict[str, int] = {}
@@ -961,6 +986,18 @@ class CulMaxCoordinator:
     async def async_shutdown(self) -> None:
         """Close the TCP connection cleanly."""
         self._shutting_down = True
+        for intent in list(self._debounce_intents.values()):
+            self._stop_debounce(intent, "cancelled")
+        for task in list(self._temperature_tasks):
+            task.cancel()
+        await asyncio.gather(*self._temperature_tasks, return_exceptions=True)
+        self._temperature_tasks.clear()
+        self._debounce_intents.clear()
+        for intent in self._desired_temperatures.values():
+            if intent.entry.status not in {"completed", "failed", "cancelled", "superseded"}:
+                self._command_queue.finish(intent.entry, "cancelled")
+            intent.overlay = False
+        self._queue_changed()
         self._reconnecting = False
         if self._reconnect_task:
             self._reconnect_task.cancel()
@@ -994,9 +1031,9 @@ class CulMaxCoordinator:
                 await self._pending_queue_task
             except asyncio.CancelledError:
                 pass
-        for task in self._auto_mode_time_sync_tasks.values():
+        for task in list(self._auto_mode_time_sync_tasks.values()):
             task.cancel()
-        for task in self._auto_mode_time_sync_tasks.values():
+        for task in list(self._auto_mode_time_sync_tasks.values()):
             try:
                 await task
             except asyncio.CancelledError:
@@ -1012,17 +1049,17 @@ class CulMaxCoordinator:
             except asyncio.CancelledError:
                 pass
             self._command_worker_task = None
-        for task in self._pending_shutter_tasks.values():
+        for task in list(self._pending_shutter_tasks.values()):
             task.cancel()
-        for task in self._pending_shutter_tasks.values():
+        for task in list(self._pending_shutter_tasks.values()):
             try:
                 await task
             except asyncio.CancelledError:
                 pass
         self._pending_shutter_tasks.clear()
-        for task in self._pending_climate_tasks.values():
+        for task in list(self._pending_climate_tasks.values()):
             task.cancel()
-        for task in self._pending_climate_tasks.values():
+        for task in list(self._pending_climate_tasks.values()):
             try:
                 await task
             except asyncio.CancelledError:
@@ -1622,98 +1659,156 @@ class CulMaxCoordinator:
     # ------------------------------------------------------------------
 
     async def async_set_temperature(
-        self,
-        address: str,
-        temperature: float,
-        mode: int = 1,  # manual
+        self, address: str, temperature: float, mode: int = MODE_MANUAL,
         until: datetime | None = None,
     ) -> CommandResult:
-        """Send SetTemperature (0x40) to a thermostat."""
+        """Accept and publish an intent immediately; queue after two quiet seconds."""
         normalized = address.upper()
+        if self._shutting_down:
+            return CommandResult("cancelled")
         self._require_paired_for_write(normalized)
-        # Validate before superseding a valid, older intent.
         if not math.isfinite(temperature):
             raise ValueError("Temperatur muss eine endliche Zahl sein")
         device = self.get_device(normalized)
-        build_set_temperature(
-            0, self.own_address, int(normalized, 16), temperature,
-            MODE_VACATION if until is not None else mode,
+        effective_mode = MODE_VACATION if until is not None else mode
+        # Validate and normalize before replacing a valid previous intent.
+        validated = build_set_temperature(
+            0, self.own_address, int(normalized, 16), temperature, effective_mode,
             until_hex=encode_max_until_datetime(until) if until is not None else "",
             group_id=device.group_id if device else 0,
         )
+        previous = self._desired_temperatures.get(normalized)
+        previous_display = previous.display_temperature if previous and previous.overlay else None
+        if normalized in self._debounce_intents:
+            self._stop_debounce(self._debounce_intents[normalized], "superseded")
+        key = f"SetTemperature:{normalized}"
+        for old in list(self._command_queue.entries.values()):
+            if old.replace_key == key and old.cancellable:
+                self._command_queue.finish(old, "superseded")
+        if len(self._command_queue.entries) + len(self._debounce_intents) >= self._command_queue.capacity:
+            raise ValueError("Sendewarteschlange ist voll")
         generation = self._temperature_generation.get(normalized, 0) + 1
         self._temperature_generation[normalized] = generation
-        for old in list(self._command_queue.entries.values()):
-            if old.replace_key == f"SetTemperature:{normalized}" and old.cancellable:
-                self._command_queue.finish(old, "superseded")
-        pending_task = self._pending_climate_tasks.get(normalized)
-        if self._pending_climate_config.get(normalized) or (
-            pending_task is not None and not pending_task.done()
-        ):
-            _LOGGER.info(
-                "SetTemperature for %s waits briefly for pending climate config to settle",
-                self._format_device_identity(normalized),
-            )
-            if pending_task is not None and not pending_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(pending_task), timeout=10.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.info(
-                        "Pending climate config for %s still active; proceeding with SetTemperature anyway",
-                        self._format_device_identity(normalized),
-                    )
+        future = self.hass.loop.create_future()
+        # Accepted intents outlive a disconnected caller, but never leak exceptions.
+        future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        label = self.format_device_label(normalized)
+        mode_label = MODE_NAMES.get(effective_mode, str(effective_mode))
+        description = f"SetTemperature {temperature:g} °C · {mode_label} · {label}"
+        if effective_mode == MODE_AUTO and temperature <= 0:
+            description = f"SetTemperature Automatik · {label}"
+        if until is not None:
+            description += f" · bis {until.strftime('%d.%m.%Y %H:%M')}"
+        entry = QueueEntry(normalized, label, "SetTemperature", description, future,
+                           replace_key=key, status="debouncing")
+        now = self.hass.loop.time()
+        display = (previous_display if previous_display is not None
+                   else (device.last_state or {}).get("desired_temperature") if device else None)
+        if not (effective_mode in (MODE_AUTO, MODE_BOOST) and temperature <= 0):
+            display = (bytes.fromhex(validated.strip()[2:])[11] & 0x3F) / 2
+        pending = self._pending_climate_tasks.get(normalized)
+        intent = TemperatureIntent(
+            normalized, temperature, effective_mode, until, generation,
+            now + self._temperature_debounce_seconds, entry, display,
+            configuration_task=pending if pending is not None and not pending.done() else None,
+            configuration_deadline=now + 10.0,
+        )
+        self._debounce_intents[normalized] = intent
+        self._desired_temperatures[normalized] = intent
+        self._command_queue.notify()
+        intent.task = self.hass.loop.create_task(self._deliver_temperature_intent(intent))
+        self._temperature_tasks.add(intent.task)
+        intent.task.add_done_callback(self._temperature_tasks.discard)
+        return await asyncio.shield(future)
 
-        dst = int(address, 16)
-        label = self.format_device_label(address)
-        counter = 0
-        effective_mode = MODE_VACATION if until is not None else mode
-        until_hex = encode_max_until_datetime(until) if until is not None else ""
-        device = self.get_device(normalized)
-        payload_group_id = device.group_id if device is not None else 0
-        cmd = build_set_temperature(
-            counter,
-            self.own_address,
-            dst,
-            temperature,
-            effective_mode,
-            until_hex=until_hex,
-            group_id=payload_group_id,
-        )
-        _LOGGER.debug(
-            "SetTemperature → %s: %.1f°C mode=%d until=%s",
-            label,
-            temperature,
-            effective_mode,
-            until.isoformat() if until is not None else "-",
-        )
-        command_label = f"SetTemperature {temperature:.1f} mode={MODE_NAMES.get(effective_mode, effective_mode)}"
-        if until is not None:
-            command_label += f" until={until.strftime('%Y-%m-%d %H:%M')}"
-        if generation != self._temperature_generation.get(normalized):
-            return CommandResult("superseded")
-        await self._set_last_command(address, command_label)
-        if generation != self._temperature_generation.get(normalized):
-            return CommandResult("superseded")
-        mode_label = {MODE_AUTO: "Automatik", MODE_MANUAL: "Manuell", MODE_BOOST: "Boost", MODE_VACATION: "Urlaub"}.get(effective_mode, str(effective_mode))
-        queue_description = (f"SetTemperature Automatik · {label}" if effective_mode == MODE_AUTO and temperature <= 0
-                             else f"SetTemperature {temperature:g} °C · {mode_label} · {label}")
-        if until is not None:
-            queue_description += f" · bis {until.strftime('%d.%m.%Y %H:%M')}"
-        result = await self._send_command(
-            cmd,
-            expected_src=address,
-            device_address=address,
-            counter=counter,
-            description=queue_description,
-            retries=SET_TEMPERATURE_ACK_RETRIES,
-            timeout=SET_TEMPERATURE_ACK_TIMEOUT,
-            replace_key=f"SetTemperature:{normalized}",
-        )
-        if result.status != "completed":
-            return result
-        if (effective_mode == MODE_AUTO and temperature <= 0 and until is None
-                and generation == self._temperature_generation.get(normalized)):
-            self._schedule_auto_mode_time_sync_followup(normalized)
+    async def _wait_temperature_deadline(self, intent: TemperatureIntent) -> None:
+        while self.hass.loop.time() < intent.deadline:
+            await asyncio.sleep(intent.deadline - self.hass.loop.time())
+
+    def _stop_debounce(self, intent: TemperatureIntent, status: str) -> None:
+        if self._debounce_intents.get(intent.address) is not intent:
+            return
+        self._debounce_intents.pop(intent.address)
+        intent.overlay = False
+        self._command_queue.finish(intent.entry, status)
+        if intent.task:
+            intent.task.cancel()
+
+    async def _deliver_temperature_intent(self, intent: TemperatureIntent) -> None:
+        try:
+            await self._wait_temperature_deadline(intent)
+            if self._debounce_intents.get(intent.address) is not intent or self._shutting_down:
+                return
+            # No await between removing the preview and registering its real entry.
+            self._debounce_intents.pop(intent.address)
+            device = self.get_device(intent.address)
+            cmd = build_set_temperature(
+                0, self.own_address, int(intent.address, 16), intent.temperature, intent.mode,
+                until_hex=encode_max_until_datetime(intent.until) if intent.until else "",
+                group_id=device.group_id if device else 0,
+            )
+            intent.entry.status = "queued"
+            intent.entry.ready_task = intent.configuration_task
+            intent.entry.ready_deadline = intent.configuration_deadline
+            if device:
+                device.last_command = intent.entry.description
+            result = await self._send_command(
+                cmd, expected_src=intent.address, device_address=intent.address,
+                counter=0, description=intent.entry.description,
+                retries=SET_TEMPERATURE_ACK_RETRIES, timeout=SET_TEMPERATURE_ACK_TIMEOUT,
+                replace_key=intent.entry.replace_key, entry=intent.entry,
+            )
+            if result.status != "completed":
+                intent.overlay = False
+            elif (intent.mode == MODE_AUTO and intent.temperature <= 0 and intent.until is None
+                  and self._desired_temperatures.get(intent.address) is intent):
+                self._schedule_auto_mode_time_sync_followup(intent.address)
+        except asyncio.CancelledError:
+            if intent.entry.status not in {"completed", "failed", "cancelled", "superseded"}:
+                self._command_queue.finish(intent.entry, "cancelled")
+            intent.overlay = False
+        except Exception as err:
+            intent.overlay = False
+            self._command_queue.finish(intent.entry, "failed", error=err)
+            _LOGGER.warning("Temperature intent for %s failed: %s", intent.address, err)
+        finally:
+            if self._debounce_intents.get(intent.address) is intent:
+                self._debounce_intents.pop(intent.address)
+            intent.configuration_task = None
+            intent.entry.payload = None
+            intent.task = None
+            self._queue_changed()
+
+    def add_temperature_listener(self, address: str, listener: Callable[[], None]) -> Callable[[], None]:
+        listeners = self._temperature_listeners.setdefault(address.upper(), [])
+        listeners.append(listener)
+        return lambda: listeners.remove(listener)
+
+    def get_temperature_intent(self, address: str) -> TemperatureIntent | None:
+        return self._desired_temperatures.get(address.upper())
+
+    def temperature_report_received(self, address: str) -> None:
+        intent = self.get_temperature_intent(address)
+        if intent and intent.entry.status == "completed":
+            intent.overlay = False
+
+    def has_queue_entry(self, entry_id: str) -> bool:
+        return entry_id in self._command_queue.entries or any(
+            intent.entry.id == entry_id for intent in self._debounce_intents.values())
+
+    def delete_queue_entry(self, entry_id: str) -> None:
+        intent = next((item for item in self._debounce_intents.values() if item.entry.id == entry_id), None)
+        if intent:
+            self._stop_debounce(intent, "cancelled")
+        else:
+            self._command_queue.delete(entry_id)
+
+    def clear_queue(self, address: str | None = None) -> dict:
+        result = self._command_queue.clear(address)
+        for intent in list(self._debounce_intents.values()):
+            if not address or intent.address == address.upper():
+                result["removed"].append(intent.entry.id)
+                self._stop_debounce(intent, "cancelled")
         return result
 
     async def _async_send_temperature_config(
@@ -3724,15 +3819,16 @@ class CulMaxCoordinator:
         device_address: str | None, counter: int | None, description: str,
         retries: int = ACK_RETRIES, timeout: float = ACK_TIMEOUT,
         replace_key: str | None = None, job_id: str | None = None,
-        protected: bool = False,
+        protected: bool = False, entry: QueueEntry | None = None,
     ) -> CommandResult:
         if job_id and self._config_jobs.get(job_id, {}).get("cancel_requested"):
             return CommandResult("cancelled")
-        future = self.hass.loop.create_future()
+        intent_future = entry is not None
+        future = entry.future if entry is not None else self.hass.loop.create_future()
         request = CommandRequest(cmd, expected_src, device_address, counter,
                                  description, retries, timeout, future)
         command_type = description.split()[0]
-        entry = QueueEntry(
+        entry = entry or QueueEntry(
             device_address.upper() if device_address else None,
             self.format_device_label(device_address) if device_address else "CUL",
             command_type, description, future, payload=request, replace_key=replace_key,
@@ -3740,16 +3836,26 @@ class CulMaxCoordinator:
             protected=protected or bool(job_id) or command_type not in {"SetTemperature", "TimeInformation", "WakeUp"},
         )
         request.entry = entry
+        entry.payload = request
         self._command_queue.add(entry)
         _LOGGER.debug("Queue: %s %s queued (%s)", command_type, device_address, entry.id)
         try:
-            return await future
+            return await asyncio.shield(future) if intent_future else await future
         except asyncio.CancelledError:
             if entry.cancellable:
                 self._command_queue.finish(entry, "cancelled")
             raise
 
     def _queue_changed(self) -> None:
+        for address, intent in self._desired_temperatures.items():
+            status = intent.entry.status
+            if status in {"failed", "cancelled", "superseded"}:
+                intent.overlay = False
+            state = (intent.generation, status, intent.overlay)
+            if self._temperature_published.get(address) != state:
+                self._temperature_published[address] = state
+                for listener in self._temperature_listeners.get(address, []):
+                    listener()
         for listener in self._queue_listeners:
             listener()
 
@@ -3759,6 +3865,13 @@ class CulMaxCoordinator:
 
     def get_queue(self) -> dict[str, Any]:
         snapshot = self._command_queue.snapshot()
+        for intent in self._debounce_intents.values():
+            remaining = max(0.0, intent.deadline - self.hass.loop.time())
+            snapshot["entries"].append(intent.entry.snapshot() | {
+                "debounce_until": (datetime.now(UTC) + timedelta(seconds=remaining)).isoformat(),
+                "debounce_remaining_seconds": remaining,
+            })
+            snapshot["waiting"] += 1
         self._ensure_config_jobs()
         snapshot["jobs"] = json.loads(json.dumps(list(self._config_jobs.values())))
         for job in snapshot["jobs"]:

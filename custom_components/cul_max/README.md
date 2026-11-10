@@ -900,7 +900,7 @@ späteren Updates die Versionskennung anpassen:
 ```yaml
 lovelace:
   resources:
-    - url: /cul-max/cul-max-queue-card.js?v=0.1.2
+    - url: /cul-max/cul-max-queue-card.js?v=0.1.3
       type: module
 ```
 
@@ -1027,3 +1027,53 @@ Dieser verwendet ausschließlich die lokale Testseite mit simulierten
 Home-Assistant-Antworten. Playwright ist keine Laufzeitabhängigkeit der Integration.
 Eine echte Home-Assistant-Laufzeit und Hardwarekommunikation müssen getrennt
 von diesen Simulationstests geprüft werden.
+
+### Zwei Sekunden Debouncing und sofortige Sollwertanzeige
+
+Ab Version 0.1.3 werden SetTemperature-Benutzerwünsche je Thermostat erst nach
+**2,0 Sekunden ohne weitere Änderung** an die Sendewarteschlange übergeben.
+Jede neue Anforderung startet die Frist dieses Geräts neu. Temperatur, Auto-,
+Manuell-, Boost- und Urlaubsmodus sowie die Endzeit bilden einen vollständigen
+Wunsch. Andere Thermostate und zeitkritische Protokollbefehle werden dadurch
+nicht verzögert. Der Eventloop kann die Ausführung nach der Frist verzögern,
+aber ein Wunsch wird nicht vor Ablauf seiner zwei Sekunden eingereiht.
+
+Die Climate-Entität zeigt den angenommenen Sollwert **sofort** an. Mehrere schnelle
+Plus-/Minus-Klicks bauen auf diesem gewünschten Wert auf. Die zuletzt gemeldete
+Gerätetemperatur bleibt getrennt gespeichert. Während des Debouncings und der
+anschließenden Übertragung setzen ältere Zustandsmeldungen oder abgeschlossene
+Vorgänger den neuen Wunsch nicht zurück. Nach einem Geräte-ACK übernimmt die
+nächste Zustandsmeldung wieder die Anzeige. Auto ohne expliziten Sollwert wird
+nicht als 0 °C angezeigt. Bei fehlgeschlagenem oder manuell abgebrochenem Wunsch
+kehrt die Anzeige zum zuletzt gemeldeten Sollwert zurück.
+
+Zusätzliche Climate-Attribute:
+
+- `requested_target_temperature`: zuletzt angenommener gewünschter Sollwert
+- `reported_target_temperature`: zuletzt vom Gerät gemeldeter Sollwert
+- `temperature_command_status`: Debounce-, Queue- oder Abschlussstatus
+
+Die Queue-Karte zeigt die Vormerkung als **Wird gesammelt** (`debouncing`) mit
+lokalem Countdown. Sie ist noch kein ausführbarer Funkauftrag und verbraucht
+weder Credits noch Nachrichtenzähler oder Budgetabfragen. Ihre ID bleibt bei der
+Übernahme in die Queue erhalten. Einzel- und Sammellöschung sowie „Queue leeren“
+entfernen die Vormerkung einschließlich Timer. Eine gelöschte Vormerkung erscheint
+nach Fristablauf nicht erneut. Die bestehende Latest-Value-Wins-Logik schützt auch
+nach dem Einreihen weiterhin vor veralteten ungesendeten Werten; bereits gesendete
+Befehle behalten ihre ACK-/Retry-Verarbeitung.
+
+Eine bestehende Konfigurationswartezeit bleibt als Ausführungsbedingung erhalten:
+Der Temperaturauftrag wird nach zwei Sekunden eingereiht, wartet gegebenenfalls
+bis zum Ende der bereits laufenden Konfigurationsaufgabe oder maximal bis zehn
+Sekunden nach Annahme. Der Worker kann währenddessen die Konfigurationspakete
+weiter abarbeiten. Es gibt keinen zweiten blockierenden Konfigurations-Worker.
+
+Beim Neuladen oder Herunterfahren werden ausstehende Timer beendet und ihre
+Aufrufer mit `cancelled` abgeschlossen. Vormerkungen sind nicht persistent und
+werden nach Neustart nicht automatisch gesendet. Sie gelten niemals allein durch
+Ablauf des Timers als erfolgreich übertragen. Beim Abbruch eines HA-Aufrufers
+bleibt ein bereits angenommener Wunsch dagegen bestehen, bis er ersetzt, manuell
+gelöscht oder durch die Integration abgeschlossen wird.
+
+Für manuell verwaltete Lovelace-Ressourcen lautet die aktuelle Cache-Kennung
+`/cul-max/cul-max-queue-card.js?v=0.1.3`.

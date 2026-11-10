@@ -631,7 +631,7 @@ type: custom:cul-max-queue-card
 title: MAX! Queue
 ```
 
-For YAML resource management, register `/cul-max/cul-max-queue-card.js?v=0.1.2`
+For YAML resource management, register `/cul-max/cul-max-queue-card.js?v=0.1.3`
 as a `module` resource. Update the version query after subsequent releases.
 The visual editor supports title, controller, device address, status and scope.
 Optional fields: `config_entry_id`, `address`, `status`, `scope` (`general` or
@@ -707,3 +707,42 @@ Optional browser checks use separately installed Playwright/Chromium:
 against a local simulated HA page, not a real HA instance or radio. Playwright is
 not an integration runtime dependency. Real HA and hardware validation remain
 separate from these simulation tests.
+
+### Two-second debounce with immediate target display
+
+Version 0.1.3 applies a **2.0-second trailing-edge debounce per thermostat** before
+SetTemperature requests enter the executable queue. Each new request restarts
+that device's deadline. Temperature, automatic/manual/boost/vacation mode and
+vacation end time form a complete intent. Other devices and time-critical
+protocol traffic are unaffected. Scheduling may execute later than the deadline,
+but never admits a request before two seconds of inactivity.
+
+The climate entity immediately displays the accepted desired value so repeated
+plus/minus clicks build on the new target. Reported device state remains separate.
+Old reports and completed predecessor requests cannot overwrite a newer pending
+intent. After the device ACK, the next thermostat report becomes authoritative.
+Automatic mode without a temperature never displays a 0 °C target. Failure or
+manual cancellation restores the most recently reported target.
+
+Climate attributes distinguish `requested_target_temperature`,
+`reported_target_temperature` and `temperature_command_status`.
+
+The queue card shows a `debouncing` preview and a local countdown. It has no
+executable RF command, message counter, credit reservation or budget queries.
+The preview retains its ID when admitted. Delete, batch delete and clear remove
+the preview and its timer, preventing later reappearance. Existing latest-value-
+wins handling remains active after admission; already transmitted requests retain
+their ACK/retry handling.
+
+Existing configuration settling is an execution prerequisite: the request enters
+the queue after two seconds, but may wait for the configuration task or until ten
+seconds after acceptance. The worker can continue processing configuration
+packets instead of blocking on that prerequisite.
+
+Reload/shutdown cancels timers, completes pending callers as `cancelled`, and
+never restores debounce previews after restart. Timer expiry alone never means
+successful transmission. Disconnecting a caller does not retract an accepted
+intent; replacement, explicit cancellation or integration shutdown does.
+
+For manually managed Lovelace resources, the current cache query is
+`/cul-max/cul-max-queue-card.js?v=0.1.3`.

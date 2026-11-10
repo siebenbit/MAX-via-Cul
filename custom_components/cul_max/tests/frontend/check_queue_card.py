@@ -16,6 +16,18 @@ with sync_playwright() as p:
     card = page.locator("cul-max-queue-card")
     expect(card.get_by_text("Solltemperatur → 23 °C", exact=True)).to_be_visible()
     expect(card.get_by_role("button", name="Nicht löschbar")).to_be_disabled()
+    page.evaluate("controller.entries[0].status='debouncing'; controller.entries[0].debounce_until=new Date(Date.now()+2000).toISOString(); card._refresh()")
+    expect(card.get_by_text("Wird gesammelt", exact=False)).to_be_visible()
+    countdown = card.locator("[data-debounce-until]")
+    before = float(countdown.inner_text().split()[0])
+    calls_before = page.evaluate("calls.length")
+    page.wait_for_timeout(250)
+    after = float(countdown.inner_text().split()[0])
+    assert after < before
+    assert page.evaluate("calls.length") == calls_before
+    card.get_by_role("button", name="Löschen", exact=True).click()
+    expect(countdown).to_have_count(0)
+    page.evaluate("resetFixture()")
     page.screenshot(path="/tmp/cul-max-queue-light.png", full_page=True)
     card.get_by_role("button", name="Löschen", exact=True).click()
     expect(card.get_by_text("Befehl gelöscht.", exact=True)).to_be_visible()
