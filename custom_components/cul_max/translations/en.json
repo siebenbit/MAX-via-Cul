@@ -18,5 +18,47 @@
         }
       }
     }
+  },
+  "services": {
+    "get_room_config": {
+      "name": "Read room configuration",
+      "description": "Room configuration for MAX! thermostats. Administrators only."
+    },
+    "save_room_config": {
+      "name": "Save room configuration",
+      "description": "Room configuration for MAX! thermostats. Administrators only.",
+      "fields": {
+        "area_id": {
+          "name": "Raum",
+          "description": "Home-Assistant-Bereich"
+        },
+        "changes": {
+          "name": "Änderungen",
+          "description": "Geänderte Temperaturparameter und Tagesprofile."
+        },
+        "expected_revision": {
+          "name": "Erwartete Revision",
+          "description": "Revisionen aus get_room_config."
+        },
+        "operation_id": {
+          "name": "Auftrags-ID",
+          "description": "Bei Wiederholung derselben Anfrage beibehalten."
+        }
+      }
+    },
+    "discard_room_config": {
+      "name": "Discard room configuration drafts",
+      "description": "Room configuration for MAX! thermostats. Administrators only.",
+      "fields": {
+        "area_id": {
+          "name": "Raum",
+          "description": "Home-Assistant-Bereich"
+        },
+        "expected_revision": {
+          "name": "Erwartete Revision",
+          "description": "Revisionen aus get_room_config."
+        }
+      }
+    }
   }
 }

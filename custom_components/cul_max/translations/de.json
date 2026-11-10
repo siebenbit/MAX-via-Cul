@@ -18,5 +18,47 @@
         }
       }
     }
+  },
+  "services": {
+    "get_room_config": {
+      "name": "Raumkonfiguration lesen",
+      "description": "Raumkonfiguration für MAX!-Thermostate. Nur für Administratoren."
+    },
+    "save_room_config": {
+      "name": "Raumkonfiguration speichern",
+      "description": "Raumkonfiguration für MAX!-Thermostate. Nur für Administratoren.",
+      "fields": {
+        "area_id": {
+          "name": "Raum",
+          "description": "Home-Assistant-Bereich"
+        },
+        "changes": {
+          "name": "Änderungen",
+          "description": "Geänderte Temperaturparameter und Tagesprofile."
+        },
+        "expected_revision": {
+          "name": "Erwartete Revision",
+          "description": "Revisionen aus get_room_config."
+        },
+        "operation_id": {
+          "name": "Auftrags-ID",
+          "description": "Bei Wiederholung derselben Anfrage beibehalten."
+        }
+      }
+    },
+    "discard_room_config": {
+      "name": "Raumkonfigurationsentwürfe verwerfen",
+      "description": "Raumkonfiguration für MAX!-Thermostate. Nur für Administratoren.",
+      "fields": {
+        "area_id": {
+          "name": "Raum",
+          "description": "Home-Assistant-Bereich"
+        },
+        "expected_revision": {
+          "name": "Erwartete Revision",
+          "description": "Revisionen aus get_room_config."
+        }
+      }
+    }
   }
 }

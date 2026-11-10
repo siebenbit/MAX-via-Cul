@@ -48,6 +48,7 @@ from .const import (
     STORAGE_SCHEMA_VERSION,
     STORAGE_VERSION,
     CLIMATE_DEVICE_TYPES,
+    DEFAULT_WEEK_PROFILE,
     )
 from .queue import CommandQueueManager, CommandResult, QueueEntry, QueueStopped
 
@@ -77,6 +78,9 @@ from .protocol import (
     normalize_week_profile_hex,
     parse_time_information_payload,
     parse_week_profile_text,
+    parse_max_temperature,
+    parse_measurement_offset,
+    parse_window_open_duration,
     parse_message,
     split_week_profile_for_send,
 )
@@ -168,6 +172,7 @@ class KnownDevice:
     last_time_offset_seconds: int | None = None
     time_slot: int = -1
     week_profile: str = ""
+    week_profile_known_days: list[int] | None = None
     comfort_temperature: float = 21.0
     eco_temperature: float = 17.0
     maximum_temperature: float = 30.5
@@ -281,6 +286,8 @@ class PendingClimateCommand:
     part: int | None = None
     chunk_hex: str = ""
     profile_hex: str = ""
+    temperature_config: dict[str, float | int] = field(default_factory=dict)
+    admitted: bool = True  # Admission persists the entire room before waking workers.
     queued_at: str = ""
     last_attempt_at: str = ""
     next_attempt_at: str = ""
@@ -342,6 +349,7 @@ def _serialize_pending_climate_command(command: PendingClimateCommand) -> dict[s
         "part": command.part,
         "chunk_hex": command.chunk_hex,
         "profile_hex": command.profile_hex,
+        "temperature_config": command.temperature_config,
         "queued_at": command.queued_at,
         "last_attempt_at": command.last_attempt_at,
         "next_attempt_at": command.next_attempt_at,
@@ -362,6 +370,7 @@ def _deserialize_pending_climate_command(data: dict[str, Any]) -> PendingClimate
         part=int(data["part"]) if data.get("part") is not None else None,
         chunk_hex=str(data.get("chunk_hex", "")),
         profile_hex=str(data.get("profile_hex", "")),
+        temperature_config=dict(data.get("temperature_config") or {}),
         queued_at=str(data.get("queued_at", "")),
         last_attempt_at=str(data.get("last_attempt_at", "")),
         next_attempt_at=str(data.get("next_attempt_at", "")),
@@ -453,6 +462,7 @@ class CulMaxCoordinator:
         self._pending_climate_config: dict[str, list[PendingClimateCommand]] = {}
         self._pending_climate_tasks: dict[str, asyncio.Task] = {}
         self._config_drafts: dict[str, dict[str, Any]] = {}
+        self._config_claims: set[tuple[str, str]] = set()
         self._credit_response: asyncio.Future[int] | None = None
         self._credit_reported: int | None = None
         self._credit_query_at: str | None = None
@@ -899,6 +909,7 @@ class CulMaxCoordinator:
     async def async_set_week_profile_day_draft(self, address: str, day_key: str, value: str) -> None:
         """Stage one week-profile day change without sending it immediately."""
         normalized = address.upper()
+        self.ensure_config_available(normalized, "week_profile")
         device = self.get_device(normalized)
         if device is None:
             raise ValueError(f"Unbekannte Geraeteadresse {address}")
@@ -917,15 +928,35 @@ class CulMaxCoordinator:
             draft["week_profile_dirty_days"] = sorted(dirty_days)
         else:
             draft.pop("week_profile_dirty_days", None)
+            draft.pop("week_profile_by_day", None)
+            if not draft:
+                self._config_drafts.pop(normalized, None)
         self._notify_week_profile_updated(normalized)
         self._notify_diagnostics_updated(normalized)
 
     async def async_set_temperature_config_draft(self, address: str, key: str, value: float | int) -> None:
         """Stage one thermostat config change without sending it immediately."""
         normalized = address.upper()
+        self.ensure_config_available(normalized, "temperature")
         if self.get_device(normalized) is None:
             raise ValueError(f"Unbekannte Geraeteadresse {address}")
-        self._config_drafts.setdefault(normalized, {})[key] = value
+        if key == "window_open_duration":
+            if not math.isfinite(float(value)) or float(value) != int(value):
+                raise ValueError("Fenster-offen-Dauer muss eine ganze Minutenzahl sein")
+            value = parse_window_open_duration(value)
+        elif key == "measurement_offset":
+            value = parse_measurement_offset(value)
+        elif key in {"comfort_temperature", "eco_temperature", "window_open_temperature"}:
+            value = parse_max_temperature(str(value))
+        else:
+            raise ValueError("Unbekannter Konfigurationsparameter")
+        draft = self._config_drafts.setdefault(normalized, {})
+        if value == getattr(self.get_device(normalized), key):
+            draft.pop(key, None)
+        else:
+            draft[key] = value
+        if not draft:
+            self._config_drafts.pop(normalized, None)
         self._notify_diagnostics_updated(normalized)
 
     async def async_discard_config_draft(self, address: str) -> None:
@@ -938,58 +969,15 @@ class CulMaxCoordinator:
 
     async def async_apply_config_draft(self, address: str) -> None:
         """Apply all staged config values for one device."""
+        from .room_config import RoomConfigManager
         normalized = address.upper()
-        draft = self._config_drafts.get(normalized)
-        if not draft:
+        if not self.has_config_draft(normalized):
             return
-
-        if "week_profile_by_day" in draft:
-            week_by_day = draft["week_profile_by_day"]
-            if isinstance(week_by_day, dict):
-                dirty_days = set(draft.get("week_profile_dirty_days") or [])
-                ordered_lines: list[str] = []
-                for day_key, label in (
-                    ("monday", "Mon"),
-                    ("tuesday", "Tue"),
-                    ("wednesday", "Wed"),
-                    ("thursday", "Thu"),
-                    ("friday", "Fri"),
-                    ("saturday", "Sat"),
-                    ("sunday", "Sun"),
-                ):
-                    if dirty_days and day_key not in dirty_days:
-                        continue
-                    day_value = str(week_by_day.get(day_key, "")).strip()
-                    if day_value:
-                        ordered_lines.append(f"{label} {day_value}")
-                if ordered_lines:
-                    await self.async_set_week_profile(normalized, "\n".join(ordered_lines))
-
-        temp_fields = {
-            key: draft[key]
-            for key in (
-                "comfort_temperature",
-                "eco_temperature",
-                "window_open_temperature",
-                "window_open_duration",
-                "measurement_offset",
-            )
-            if key in draft
-        }
-        if temp_fields:
-            await self._async_send_temperature_config(
-                normalized,
-                comfort_temperature=temp_fields.get("comfort_temperature"),
-                eco_temperature=temp_fields.get("eco_temperature"),
-                window_open_temperature=temp_fields.get("window_open_temperature"),
-                window_open_duration=temp_fields.get("window_open_duration"),
-                measurement_offset=temp_fields.get("measurement_offset"),
-            )
-
-        if normalized in self._config_drafts:
-            del self._config_drafts[normalized]
-        self._notify_week_profile_updated(normalized)
-        self._notify_diagnostics_updated(normalized)
+        manager = RoomConfigManager(self.hass, {"device": self}, members=lambda: [
+            {"area_id": normalized, "area_name": normalized, "address": normalized, "config_entry_id": "device"}
+        ])
+        revision = manager.snapshot()["rooms"][0]["revision"]
+        await manager.save(normalized, {}, revision, str(uuid4()))
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1976,7 +1964,36 @@ class CulMaxCoordinator:
                 self._stop_debounce(intent, "cancelled")
         return result
 
-    async def _async_send_temperature_config(
+    def config_busy(self, address: str, block: str) -> bool:
+        """Include reservations, persistent work, and legacy direct commands."""
+        address = address.upper()
+        if (address, block) in self._config_claims:
+            return True
+        for command in self._pending_climate_config.get(address, []):
+            if ("temperature" if command.op == "config_temperatures" else "week_profile") == block:
+                return True
+        return any(entry.device_address == address and
+                   (entry.command_type.startswith("ConfigTemperatures") if block == "temperature"
+                    else entry.command_type.startswith("ConfigWeekProfile"))
+                   for entry in self._command_queue.entries.values())
+
+    def ensure_config_available(self, address: str, block: str) -> None:
+        if self.config_busy(address, block):
+            raise ValueError("Dieser Konfigurationsblock wird bereits übertragen. Bitte Auftrag abschließen oder abbrechen.")
+
+    async def _async_send_temperature_config(self, address: str, **values) -> None:
+        """Claim the entire combined packet even for legacy service callers."""
+        self.ensure_config_available(address, "temperature")
+        claim = (address.upper(), "temperature")
+        self._config_claims.add(claim)
+        self._notify_diagnostics_updated(address)
+        try:
+            await self._send_temperature_config_packet(address, **values)
+        finally:
+            self._config_claims.discard(claim)
+            self._notify_diagnostics_updated(address)
+
+    async def _send_temperature_config_packet(
         self,
         address: str,
         *,
@@ -1985,6 +2002,7 @@ class CulMaxCoordinator:
         window_open_temperature: float | None = None,
         window_open_duration: int | None = None,
         measurement_offset: float | None = None,
+        job_id: str | None = None,
     ) -> None:
         """Send one combined ConfigTemperatures command and persist the values."""
         device = self.get_device(address)
@@ -2055,7 +2073,7 @@ class CulMaxCoordinator:
         summary = ", ".join(summary_bits) or "ConfigTemperatures"
         _LOGGER.info("ConfigTemperatures → %s: %s", label, summary)
         await self._set_last_command(address, f"ConfigTemperatures {summary}")
-        await self._send_command(
+        result = await self._send_command(
             cmd,
             expected_src=address,
             device_address=address,
@@ -2063,7 +2081,10 @@ class CulMaxCoordinator:
             description=f"ConfigTemperatures {label}",
             retries=CONFIG_ACK_RETRIES,
             timeout=CONFIG_ACK_TIMEOUT,
+            job_id=job_id,
         )
+        if result.status != "completed":
+            raise QueueStopped(result.status)
 
         device.comfort_temperature = comfort
         device.eco_temperature = eco
@@ -2430,19 +2451,15 @@ class CulMaxCoordinator:
     ) -> None:
         """Replace queued climate-config commands for one device."""
         normalized = address.upper()
+        self.ensure_config_available(normalized, "week_profile")
         now_iso = self._now_iso()
         for command in commands:
             if not command.queued_at:
                 command.queued_at = now_iso
-        for old in self._pending_climate_config.get(normalized, []):
-            job = self._config_jobs.get(old.job_id)
-            if job:
-                job["cancel_requested"] = True
-                job["status"] = "cancelled"
         job_id = str(uuid4())
         for command in commands:
             command.job_id = job_id
-        self._pending_climate_config[normalized] = commands
+        self._pending_climate_config.setdefault(normalized, []).extend(commands)
         if commands:
             _LOGGER.info(
                 "Queued %d pending climate-config commands for %s",
@@ -2490,6 +2507,8 @@ class CulMaxCoordinator:
                 if not queue:
                     break
                 command = queue[0]
+                if not command.admitted:
+                    break
                 if not self._pending_due(command):
                     break
                 try:
@@ -2573,6 +2592,11 @@ class CulMaxCoordinator:
         trigger: str,
     ) -> None:
         """Deliver one queued climate config command."""
+        if command.op == "config_temperatures":
+            await self._send_temperature_config_packet(address, job_id=command.job_id,
+                                                       **command.temperature_config)
+            self._record_config_step(command, confirmed=True)
+            return
         if command.op != "config_week_profile":
             raise ValueError(f"Unbekannter pending climate command {command.op}")
 
@@ -2607,7 +2631,20 @@ class CulMaxCoordinator:
         self._record_config_step(command, confirmed=True)
         device = self.get_device(address)
         if device is not None and command.profile_hex:
-            device.week_profile = command.profile_hex
+            day = int(command.day or 0)
+            if device.week_profile_known_days is None:
+                device.week_profile_known_days = list(range(7)) if device.week_profile else []
+            # A partially acknowledged day is not a confirmed day profile.
+            if day in device.week_profile_known_days:
+                device.week_profile_known_days.remove(day)
+            job = self._config_jobs.get(command.job_id, {})
+            steps = [step for step in job.get("steps", []) if step.get("day") == day]
+            needed = len(split_week_profile_for_send(command.profile_hex, day))
+            if len(steps) == needed and all(step["id"] in job.get("confirmed_steps", []) for step in steps):
+                base = device.week_profile or DEFAULT_WEEK_PROFILE
+                start = day * 52
+                device.week_profile = base[:start] + command.profile_hex[start:start + 52] + base[start + 52:]
+                device.week_profile_known_days.append(day)
             await self._save_devices()
             self._notify_week_profile_updated(address)
         _LOGGER.info(
@@ -3634,6 +3671,7 @@ class CulMaxCoordinator:
         if device.device_type not in CLIMATE_DEVICE_TYPES:
             raise ValueError(f"Geraet {address} unterstuetzt kein Wochenprofil")
         self._require_paired_for_write(address)
+        self.ensure_config_available(address, "week_profile")
 
         updates = parse_week_profile_text(profile_text)
         merged_profile = encode_week_profile(updates, self.get_local_week_profile(address))
@@ -3668,7 +3706,6 @@ class CulMaxCoordinator:
         else:
             _LOGGER.info("Week profile for %s uploaded successfully", self._format_device_identity(address))
 
-        device.week_profile = merged_profile
         await self._save_devices()
         self._notify_week_profile_updated(address)
         await self._sync_pending_config_reading(address)
@@ -4071,7 +4108,7 @@ class CulMaxCoordinator:
         self._ensure_config_jobs()
         snapshot["jobs"] = json.loads(json.dumps(list(self._config_jobs.values())))
         for job in snapshot["jobs"]:
-            job["command_type"] = "WeekProfile" if job["kind"] == "climate" else "Configuration"
+            job["command_type"] = "ConfigTemperatures" if job.get("block") == "temperature" else "WeekProfile" if job["kind"] == "climate" else "Configuration"
             active = next((entry for entry in self._command_queue.entries.values() if entry.job_id == job["id"]), None)
             if active and not job.get("cancel_requested"):
                 job["status"] = active.status
@@ -4094,6 +4131,11 @@ class CulMaxCoordinator:
                     })
                     if not any(step["id"] == command.step_id for step in job["steps"]):
                         job["steps"].append({"id": command.step_id, "description": command.description})
+                    if kind == "climate":
+                        job["block"] = "temperature" if command.op == "config_temperatures" else "week_profile"
+                        for step in job["steps"]:
+                            if step["id"] == command.step_id:
+                                step.update(day=command.day, part=command.part)
         pending_jobs = {command.job_id for queues in (self._pending_climate_config, self._pending_shutter_config)
                         for commands in queues.values() for command in commands}
         live_jobs = {entry.job_id for entry in self._command_queue.entries.values()}
@@ -5163,6 +5205,7 @@ class CulMaxCoordinator:
                 pending_config=[],
                 last_command=d.get("last_command", ""),
                 week_profile=d.get("week_profile", ""),
+                week_profile_known_days=d.get("week_profile_known_days"),
                 comfort_temperature=float(d.get("comfort_temperature", 21.0)),
                 eco_temperature=float(d.get("eco_temperature", 17.0)),
                 maximum_temperature=float(d.get("maximum_temperature", 30.5)),
@@ -5205,6 +5248,15 @@ class CulMaxCoordinator:
             ]
             if restored:
                 self._pending_climate_config[normalized] = restored
+                device = self.get_device(normalized)
+                # Older versions stored the whole target before all ACKs. Its
+                # still-pending days cannot serve as confirmed templates.
+                if (device and device.week_profile
+                        and "week_profile_known_days" not in data.get("devices", {}).get(addr, {})):
+                    pending_days = {command.day for command in restored if command.op == "config_week_profile"}
+                    if pending_days:
+                        device.week_profile_known_days = [day for day in range(7) if day not in pending_days]
+                        changed = True
         _LOGGER.info("Loaded %d known MAX! devices from storage", len(self._devices))
         for address in self._devices:
             await self._sync_device_registry_entry(address)
@@ -5253,6 +5305,7 @@ class CulMaxCoordinator:
                     "duplicate_reason": d.duplicate_reason,
                     "last_command": d.last_command,
                     "week_profile": d.week_profile,
+                    "week_profile_known_days": d.week_profile_known_days,
                     "comfort_temperature": d.comfort_temperature,
                     "eco_temperature": d.eco_temperature,
                     "maximum_temperature": d.maximum_temperature,

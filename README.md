@@ -268,3 +268,25 @@ The German manual-mode label is **Manuell**. Valve position is reported separate
 without inferring heating activity. See the
 [English state guide](custom_components/cul_max/README.en.md#consistent-thermostat-state)
 or [German state guide](custom_components/cul_max/README.md#konsistente-thermostatzustände).
+
+## Room configuration dashboard
+
+The new `custom:cul-max-room-config-card` edits the four thermostat configuration
+values and weekly schedules for all MAX! thermostats in a selected Home Assistant
+area. Changes stay in a draft until **Save**; the card displays durable jobs and
+per-device ACK progress. A day can be copied to all seven days before saving.
+
+```yaml
+type: custom:cul-max-room-config-card
+title: MAX! Raumkonfiguration
+# Optional initial area:
+# area_id: living_room
+```
+
+Use the visual card picker or put this card in a dashboard view with **Panel**
+layout. Resources register automatically; YAML dashboards can register
+`/cul-max/cul-max-room-config-card.js` as a JavaScript module. See the
+[German room guide](custom_components/cul_max/README.md#raumkonfiguration-mit-grafischem-wochenplan)
+or [English room guide](custom_components/cul_max/README.en.md#room-configuration-with-a-graphical-week-editor)
+for installation, locks and conflict handling. The configuration card and its API
+require an administrator account.

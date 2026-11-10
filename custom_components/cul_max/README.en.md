@@ -905,3 +905,72 @@ wall valve values and wall modes lacking report provenance are discarded; the
 next full wall status supplies the mode again. Entity IDs remain unchanged.
 Current HA uses the native temperature API; earlier supported versions retain a
 compatibility path.
+
+## Room configuration with a graphical week editor
+
+`custom:cul-max-room-config-card` edits comfort, eco and window-open temperatures,
+window-open duration and weekly schedules for **all MAX! thermostats in one HA
+area**. Entity area overrides take precedence over device areas. RF group IDs and
+peer links are not modified. The card and its API are administrator-only.
+
+Add a dashboard view with **Panel (single card)** layout, then choose **MAX!
+Raumkonfiguration** in the visual card picker, or use:
+
+```yaml
+type: custom:cul-max-room-config-card
+title: MAX! Raumkonfiguration
+# Optional initial area:
+# area_id: living_room
+```
+
+The visual editor exposes the title and initial room. After an integration update,
+restart HA for automatic resource registration. YAML dashboards can register
+`/cul-max/cul-max-room-config-card.js` as a JavaScript module. Existing dashboards
+and the other cards remain available; no dashboard is modified automatically.
+
+Edits remain drafts until **Save**. One Save admits all changed values for the
+selected room. Mixed device values are shown as mixed; no reference device is
+silently chosen. Select a device's day explicitly as a template or create a new
+one. The stepped graph updates as rows are edited. Time is always 24-hour format;
+`0630` becomes `06:30`. A day starts at 00:00 and ends at 24:00, using five-minute
+times, half-degree temperatures and at most 13 sections. **Tag auf alle Tage
+kopieren** copies the selected day to seven independent drafts after confirmation.
+Nothing is transmitted until Save. Copying whole configurations to other rooms
+is not included yet.
+
+**Discard** affects unsaved edits only. Existing drafts from the legacy device
+entities can also be discarded after confirmation; queued work is never removed.
+Changing rooms prompts before losing edits. A reconnect retains the draft; a full
+browser reload loses local drafts after the normal browser warning. Accepted
+operations remain in durable storage.
+
+The four combined temperature parameters lock together while pending, and the
+whole weekly schedule is a second lock block. Other rooms and free blocks remain
+editable. Legacy actions and entities enforce the same locks in the backend.
+A pending retry retains its lock. Revision checks reject stale edits from another
+browser or changed area membership without overwriting the draft. Retrying the
+same operation ID does not enqueue the same work twice.
+
+Queued is not confirmed. The device progress section shows ACK counts, live
+status and errors. A schedule day is confirmed only after its required parts are
+acknowledged; partial days are not offered as complete templates. Cancelling a
+configuration job waits for its active radio packet to finish, and never undoes
+already confirmed steps. Existing queue persistence resumes work after restart.
+There is no full device configuration readback: confirmation means an acknowledged
+write. Live updates use a coalesced WebSocket subscription instead of polling.
+
+Public admin interfaces:
+
+- `cul_max.get_room_config`: returns `rooms` with values, drafts, revisions, locks
+  and per-device jobs.
+- `cul_max.save_room_config`: takes `area_id`, `changes`, `expected_revision`,
+  `operation_id`; returns `accepted` or `unchanged`, an operation ID and job IDs.
+- `cul_max.discard_room_config`: takes `area_id`, `expected_revision` and removes
+  only unsaved device drafts.
+- WebSocket `cul_max/room_config/subscribe`: initial snapshot and updates, with
+  standard HA unsubscribe support.
+
+`changes` accepts the four parameter keys plus `week_profile`, mapping `monday`
+through `sunday` to existing day strings such as `17,06:00,21,22:00,17`. Revisions
+come from the snapshot. Keep the same ID and payload when retrying a save after
+connection loss. No new runtime dependencies or real RF tests are required.

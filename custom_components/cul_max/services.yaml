@@ -1168,3 +1168,60 @@ cancel_config_job:
       required: true
       selector:
         boolean:
+
+get_room_config:
+  name: Raumkonfiguration lesen
+  description: >
+    Liefert HA-Räume, gespeicherte Werte, Entwürfe, eingereihte Zielwerte,
+    Sperren und Übertragungsfortschritt für MAX!-Thermostate. Nur für Administratoren.
+
+save_room_config:
+  name: Raumkonfiguration speichern
+  description: >
+    Prüft und reiht alle Änderungen für sämtliche Thermostate eines HA-Bereichs ein.
+    Die Antwort bestätigt die Annahme des Auftrags, nicht dessen Funkübertragung.
+    Nur für Administratoren. Gleiche Auftrags-IDs erzeugen keine doppelten Aufträge.
+  fields:
+    area_id:
+      name: Raum
+      required: true
+      selector:
+        area:
+    changes:
+      name: Änderungen
+      description: >
+        comfort_temperature, eco_temperature, window_open_temperature,
+        window_open_duration sowie week_profile mit Tagesnamen monday bis sunday
+        und Tagesprofilen im Format 17,06:00,21,22:00,17. Nur geänderte Werte übergeben.
+      required: true
+      selector:
+        object:
+    expected_revision:
+      name: Erwartete Revision
+      description: Unveränderte temperature- und week_profile-Revision aus get_room_config.
+      required: true
+      selector:
+        object:
+    operation_id:
+      name: Auftrags-ID
+      description: Eindeutige ID (maximal 80 Zeichen); bei Wiederholung derselben Anfrage beibehalten.
+      required: true
+      selector:
+        text:
+
+discard_room_config:
+  name: Raumkonfigurationsentwürfe verwerfen
+  description: >
+    Verwirft nur ungespeicherte Geräteentwürfe eines HA-Raums. Bereits eingereihte
+    Aufträge werden nicht abgebrochen. Nur für Administratoren.
+  fields:
+    area_id:
+      name: Raum
+      required: true
+      selector:
+        area:
+    expected_revision:
+      name: Erwartete Revision
+      required: true
+      selector:
+        object:

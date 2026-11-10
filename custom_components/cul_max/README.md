@@ -1259,3 +1259,113 @@ und Wand-Modi ohne nachweisbare Statusherkunft werden verworfen; der nächste vo
 Wandbericht liefert den Modus wieder. Entitäts-IDs bleiben erhalten. Aktuelle
 HA-Versionen verwenden die native Temperatur-API; ältere unterstützte Versionen
 behalten einen Kompatibilitätszweig.
+
+## Raumkonfiguration mit grafischem Wochenplan
+
+Die neue Karte bearbeitet gemeinsam alle MAX!-Thermostate eines HA-Bereichs:
+Komforttemperatur, Ecotemperatur, Fenster-offen-Temperatur, Fenster-offen-Dauer
+und die sieben Tagesprofile. Das Raum-Dropdown verwendet HA-Bereiche. Eine
+Bereichszuordnung der Climate-Entität hat Vorrang vor der Gerätezuordnung.
+MAX!-Funkgruppen und Geräteverknüpfungen werden dadurch nicht geändert.
+
+### Als eigene Dashboard-Ansicht hinzufügen
+
+1. Weise deine MAX!-Thermostate in HA den gewünschten Bereichen zu.
+2. Starte HA nach der Aktualisierung der Integration neu. Die JS-Ressource wird
+   wie bei den bisherigen Karten automatisch registriert.
+3. Erstelle in deinem Dashboard eine Ansicht im Layout **Panel (eine Karte)**.
+4. Füge die Karte **MAX! Raumkonfiguration** über die Kartenauswahl hinzu, oder
+   verwende diese YAML-Konfiguration:
+
+```yaml
+type: custom:cul-max-room-config-card
+title: MAX! Raumkonfiguration
+# Optional: Bereich beim Öffnen vorauswählen
+# area_id: wohnzimmer
+```
+
+Der visuelle Karteneditor bietet Titel und Start-Raum an. Für YAML-Dashboards:
+
+```yaml
+resources:
+  - url: /cul-max/cul-max-room-config-card.js
+    type: module
+```
+
+Die Karte ist für Administratoren vorgesehen. Sie verwendet HA-Aktionen und ein
+Admin-WebSocket-Abonnement, keine internen Python-Objekte und keine externen
+JavaScript-Bibliotheken. Updates verwenden die vorhandene versionierte
+Ressourcenregistrierung. Die bisherigen Wochenprofil- und Queue-Karten bleiben
+verfügbar. Die Integration verändert keine bestehenden Dashboard-Ansichten.
+
+### Entwurf und gemeinsames Speichern
+
+Eingaben ändern zunächst nur den Entwurf. **Speichern** übernimmt alle geänderten
+Werte gemeinsam für sämtliche Thermostate des gewählten Raums. Nicht geänderte
+Blöcke und bereits bestätigte identische Werte erzeugen keine neuen Funkaufträge.
+Bei unterschiedlichen Ausgangswerten erscheint **Gemischt**; es wird kein Gerät
+still als Vorlage verwendet. Ein Tagesprofil kann ausdrücklich von einem der
+Raumgeräte übernommen oder neu angelegt werden.
+
+Der Wochenplan verwendet eine Stufenkurve und präzise Eingabezeilen:
+
+- Der erste Abschnitt beginnt fest um 00:00; der letzte reicht bis 24:00.
+- Uhrzeiten werden im 24-Stunden-Format eingegeben (`0630` wird zu `06:30`).
+- MAX! erlaubt fünf Minuten Zeitraster, halbe Temperaturgrade und höchstens
+  13 Temperaturabschnitte pro Tag.
+- **Tag auf alle Tage kopieren** ersetzt nach Bestätigung die sieben Tagesentwürfe.
+  Erst Speichern startet die Übertragung.
+
+**Verwerfen** verwirft ausschließlich ungespeicherte Änderungen. Vorhandene
+Entwürfe aus den bisherigen Geräte-Entitäten können nach Rückfrage ebenfalls
+verworfen werden. Eingereihte Aufträge und bestätigte Werte bleiben erhalten.
+Ein Raumwechsel mit Änderungen fragt nach; Wiederverbindung erhält den offenen
+Entwurf. Ein vollständiges Neuladen der Browserseite verwirft lokale Entwürfe
+(nach dem üblichen Browserhinweis). Akzeptierte Aufträge bleiben gespeichert.
+Kopieren der gesamten Konfiguration auf andere Räume ist noch nicht enthalten.
+
+### Sperren, Konflikte und Teilübertragung
+
+Die vier Temperaturparameter werden zusammen in einem Funkpaket übertragen und
+bilden daher einen Sperrblock; der gesamte Wochenplan bildet den zweiten.
+Während ein Block eingereiht ist oder übertragen wird, bleibt er lesbar und wird
+für weitere Änderungen gesperrt. Andere Räume und der jeweils freie Block bleiben
+bedienbar. Die Sperre gilt auch für die bisherigen Konfigurationsaktionen und
+Geräteentitäten. Bei einem Fehler mit ausstehendem Retry bleibt der Block gesperrt.
+
+Eine Revision verhindert, dass ein zweiter Browser oder eine geänderte
+Raumzuordnung einen veralteten Entwurf unbemerkt speichert. Bei Konflikten bleibt
+der Entwurf sichtbar; Verwerfen lädt den aktuellen Stand. Mehrfachklicks und
+wiederholte Anfragen mit derselben Auftrags-ID erzeugen keine weiteren Aufträge.
+
+**Eingereiht ist nicht bestätigt.** Unter „Geräte und Übertragungsfortschritt“
+stehen Status, bestätigte Paketanzahl und Fehler pro Gerät. Erst ACKs bestätigen
+übertragene Werte. Ein Wochenplantag gilt erst nach seinen erforderlichen
+Teilpaketen als bestätigt. Teilübertragene Tage werden nicht als vollständiges
+Profil angeboten. Ein Auftrag kann hier oder in der Queue-Karte ausdrücklich
+abgebrochen werden: Eine laufende Übertragung endet zuerst; bestätigte Teile
+bleiben am Gerät. Ein Abbruch ist kein Zurücksetzen der Hardware.
+
+Aufträge laufen in der bestehenden persistenten Queue und werden nach Neustart
+fortgesetzt. Sperren ergeben sich aus dieser Queue und laufenden Befehlen, nicht
+aus Browser-Timern. Die Oberfläche lädt nach Reconnect den aktuellen Stand und
+erhält Statusänderungen ohne regelmäßiges Polling. Es gibt kein echtes vollständiges
+Konfigurations-Readback: „bestätigt“ bezeichnet einen ACK-bestätigten Schreibvorgang.
+
+### Öffentliche Schnittstellen
+
+- `cul_max.get_room_config`: Räume, gespeicherte und vorgemerkte Werte, Revisionen,
+  Gerätestatus und Sperren. Antwort unter `rooms`.
+- `cul_max.save_room_config`: `area_id`, `changes`, `expected_revision`, `operation_id`.
+  Antwort `status: accepted` oder `unchanged`, dazu `operation_id` und `job_ids`.
+- `cul_max.discard_room_config`: `area_id`, `expected_revision`; entfernt nur
+  ungespeicherte Geräteentwürfe.
+- WebSocket `cul_max/room_config/subscribe`: initiale Raumübersicht und zusammengefasste
+  Aktualisierungen. Die übliche HA-Abmeldung entfernt das Abonnement.
+
+Alle Schnittstellen sind auf Administratoren begrenzt. `changes` enthält nur
+geänderte Schlüssel: `comfort_temperature`, `eco_temperature`,
+`window_open_temperature`, `window_open_duration` und optional `week_profile` mit
+Tagesnamen `monday` bis `sunday` und Profilstrings wie `17,06:00,21,22:00,17`.
+`expected_revision` stammt unverändert aus der Raumübersicht. Bei einer Wiederholung
+nach Verbindungsverlust müssen Auftrags-ID und Nutzdaten unverändert bleiben.
