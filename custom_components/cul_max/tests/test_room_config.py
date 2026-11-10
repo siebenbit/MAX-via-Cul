@@ -46,6 +46,22 @@ class RoomConfigTests(unittest.IsolatedAsyncioTestCase):
         self.tasks.extend(tasks)
         await asyncio.wait_for(asyncio.gather(*tasks), 3)
 
+    async def test_admission_has_one_save_and_replay_wakes_existing_work(self):
+        self.c._save_devices = AsyncMock(side_effect=[None, OSError("unexpected second save")])
+        revision = self.room()["revision"]
+        result = await self.save({"eco_temperature": 18}, revision=revision)
+        self.assertEqual(self.c._save_devices.await_count, 1)
+        self.assertTrue(all(cmd.admitted for q in self.c._pending_climate_config.values() for cmd in q))
+        self.c._schedule_climate_config_processing = lambda *args, **kwargs: calls.append(args[0])
+        calls = []
+        # Also recover an operation left blocked by an earlier software version.
+        self.c._pending_climate_config["234567"][0].admitted = False
+        replay = await self.save({"eco_temperature": 18}, revision=revision)
+        self.assertEqual(result["job_ids"], replay["job_ids"])
+        self.assertEqual(set(calls), {"123456", "234567"})
+        self.assertTrue(self.c._pending_climate_config["234567"][0].admitted)
+        self.assertEqual(sum(map(len, self.c._pending_climate_config.values())), 2)
+
     async def test_room_snapshot_aggregates_mixed_values_without_selecting_a_device(self):
         self.c.get_device("234567").eco_temperature = 18
         result = self.room()

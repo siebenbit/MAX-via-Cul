@@ -54,6 +54,140 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity._attr_preset_mode, preset)
         self.assertIsNone(entity._attr_hvac_action)
 
+    async def feed_packet(self, kind, payload, counter=201):
+        body = bytes([counter, 0, kind]) + bytes.fromhex("123456") + self.c.own_address.to_bytes(3, "big") + b"\x00" + payload
+        self.cul.feed("Z" + bytes([len(body)]).hex() + body.hex())
+        await self.settle()
+
+    async def test_off_manual_uses_confirmed_return_target_or_twenty(self):
+        entity = await self.entity()
+        for remembered, expected in ((None, 20), (23, 23)):
+            await self.report(4.5, mode=1)
+            self.c.get_device("123456").last_normal_target = remembered
+            task = asyncio.create_task(entity.async_set_hvac_mode("heat"))
+            self.tasks.append(task)
+            await self.settle()
+            self.assertEqual(self.display()["target_temperature"], expected)
+            self.assertEqual(self.display()["hvac_mode"], "heat")
+            await self.advance(2.01)
+            await asyncio.wait_for(task, .5)
+            self.assertEqual(self.c.get_device("123456").last_normal_target, expected)
+
+    async def test_cancelled_off_return_does_not_change_remembered_target(self):
+        entity = await self.entity()
+        await self.report(24, mode=1)
+        await self.report(4.5, mode=1)
+        task = asyncio.create_task(entity.async_set_hvac_mode("heat"))
+        self.tasks.append(task)
+        await self.settle()
+        self.c.clear_queue()
+        await task
+        self.assertEqual(self.display()["hvac_mode"], "off")
+        self.assertEqual(self.c.get_device("123456").last_normal_target, 24)
+
+    async def test_return_target_survives_restart_without_restoring_optimistic_state(self):
+        await self.report(23, mode=1)
+        await self.report(4.5, mode=1)
+        task = self.request(25)
+        await self.settle()
+        self.c._store = types.SimpleNamespace(async_save=AsyncMock())
+        await mod.CulMaxCoordinator._save_devices(self.c)
+        saved = self.c._store.async_save.call_args.args[0]
+        fresh = mod.CulMaxCoordinator(self.c.hass, "simulated")
+        fresh._store = types.SimpleNamespace(async_load=AsyncMock(return_value=saved))
+        fresh._save_devices = AsyncMock()
+        fresh._sync_device_registry_entry = AsyncMock()
+        await fresh._load_devices()
+        self.assertEqual(fresh.get_device("123456").last_normal_target, 23)
+        self.assertEqual(fresh.get_display_state("123456")["hvac_mode"], "off")
+        self.c.clear_queue()
+        await task
+
+    async def test_unconfirmed_target_does_not_replace_off_return_target(self):
+        await self.report(23, mode=1)
+        self.cul.frame_hook = lambda *args: None
+        with patch.object(mod, "SET_TEMPERATURE_ACK_RETRIES", 1), patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
+            task = self.request(25)
+            await self.settle()
+            await self.advance(2.01)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), .5)
+        self.assertEqual(self.c.get_device("123456").last_normal_target, 23)
+
+    async def test_embedded_ack_preserves_missing_measurement_and_rejects_negative(self):
+        await self.report(20, mode=0)
+        self.c._pending_ack = mod.PendingAck(201, "123456", self.c.hass.loop.create_future(), "state test")
+        await self.feed_packet(2, bytes([1, 1, 35, 44]))
+        self.assertEqual(self.display()["target_temperature"], 22)
+        self.assertEqual(self.display()["reported"]["valve_position"], 35)
+        self.assertEqual(self.display()["current_temperature"], 19)
+        await self.feed_packet(2, bytes([0x81, 0, 0, 36]))
+        await self.feed_packet(2, bytes([1]))
+        self.assertEqual(self.display()["target_temperature"], 22)
+
+    async def test_late_embedded_ack_cannot_roll_back_newer_confirmed_target(self):
+        await self.complete(22)
+        old_counter = bytes.fromhex(self.cul.frames[0].strip()[2:])[1]
+        await self.complete(24)
+        previous = dict(self.display()["reported"])
+        await self.feed_packet(2, bytes([1, 1, 30, 44]), counter=old_counter)
+        self.assertEqual(self.display()["target_temperature"], 24)
+        self.assertEqual(self.display()["reported"], previous)
+        self.assertEqual(self.c.get_device("123456").last_normal_target, 24)
+
+    async def test_mismatched_or_expired_ack_does_not_change_state_or_confirm(self):
+        await self.report(24, mode=1)
+        future = self.c.hass.loop.create_future()
+        self.c._pending_ack = mod.PendingAck(202, "123456", future, "new request")
+        await self.feed_packet(2, bytes([1, 0, 30, 44]), counter=201)
+        self.assertFalse(future.done())
+        self.assertEqual(self.display()["target_temperature"], 24)
+        self.c._pending_ack.expected_src = "234567"
+        await self.feed_packet(2, bytes([1, 0, 30, 44]), counter=202)
+        self.assertFalse(future.done())
+        self.assertEqual(self.display()["target_temperature"], 24)
+        self.c._pending_ack.expected_src = "123456"
+        self.c._pending_ack.expected_dst = "654321"
+        await self.feed_packet(2, bytes([1, 0, 30, 44]), counter=202)
+        self.assertFalse(future.done())
+        self.assertEqual(self.display()["target_temperature"], 24)
+        self.c._pending_ack.expected_dst = None
+        self.c._pending_ack.deadline = self.c.hass.loop.time() - 1
+        await self.feed_packet(2, bytes([1, 0, 30, 44]), counter=202)
+        self.assertFalse(future.done())
+        self.assertEqual(self.display()["hvac_mode"], "heat")
+        self.assertEqual(self.display()["target_temperature"], 24)
+        future.cancel()
+
+    async def test_matching_ack_with_state_synchronizes_target(self):
+        def acknowledge(cul, command):
+            packet = bytes.fromhex(command.strip()[2:])
+            body = (bytes([packet[1], 0, 2]) + bytes.fromhex("123456")
+                    + self.c.own_address.to_bytes(3, "big") + b"\x00"
+                    + bytes([1, 1, 30, 44]))
+            cul.feed("Z" + bytes([len(body)]).hex() + body.hex())
+        self.cul.frame_hook = acknowledge
+        await self.complete(22)
+        self.assertEqual(self.display()["command_status"], "synchronized")
+        self.assertEqual(self.display()["reported_target_temperature"], 22)
+        self.assertEqual(self.display()["reported"]["valve_position"], 30)
+        await self.report(18, mode=0)
+        self.assertEqual(self.display()["target_temperature"], 18)
+
+    async def test_wall_set_temperature_preserves_pending_wish_and_updates_cancel_fallback(self):
+        self.c.get_device("123456").device_type = mod.DEVICE_WALL_THERMOSTAT
+        task = self.request(24)
+        await self.settle()
+        await self.feed_packet(0x40, bytes([0x40 | 44]))
+        self.assertEqual(self.display()["target_temperature"], 24)
+        self.assertEqual(self.display()["reported_target_temperature"], 22)
+        self.c.clear_queue()
+        await task
+        self.assertEqual(self.display()["target_temperature"], 22)
+        await self.feed_packet(0x40, bytes([0]))  # auto without a target
+        self.assertEqual(self.display()["hvac_mode"], "auto")
+        self.assertEqual(self.display()["target_temperature"], 22)
+        self.assertFalse(self.cul.frames)
+
     async def test_unsolicited_local_and_schedule_changes_update_without_sending(self):
         entity = await self.entity()
         await self.report(23, mode=1, valve=45)

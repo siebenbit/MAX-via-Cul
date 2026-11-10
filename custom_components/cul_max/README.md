@@ -1369,3 +1369,31 @@ geänderte Schlüssel: `comfort_temperature`, `eco_temperature`,
 Tagesnamen `monday` bis `sunday` und Profilstrings wie `17,06:00,21,22:00,17`.
 `expected_revision` stammt unverändert aus der Raumübersicht. Bei einer Wiederholung
 nach Verbindungsverlust müssen Auftrags-ID und Nutzdaten unverändert bleiben.
+
+
+### Korrekturen an Konfigurationsaufträgen und Zuständen
+
+Gespeicherte Raumaufträge werden nach erfolgreicher Speicherung gemeinsam für den
+Versand freigegeben. Wiederholungen derselben Auftrags-ID erzeugen keine Duplikate
+und stoßen wartende Arbeit erneut an. Bei einem Speicherfehler einschließlich
+fehlgeschlagener Rücknahme wird der Ausgang ausdrücklich als unklar gemeldet.
+
+OFF bedeutet weiterhin Manuell mit 4,5 °C (Frostschutz). Zurück auf Manuell wird der
+letzte gemeldete oder per ACK bestätigte Sollwert oberhalb 4,5 °C verwendet; ohne
+bekannten Wert sind es 20 °C. Ungesendete oder unbestätigte Wünsche ersetzen diesen
+Rückkehrwert nicht. Der Rückkehrwert bleibt über Neustarts erhalten.
+
+Positive ACKs mit eingebettetem Gerätezustand und SetTemperature-Nachrichten
+bekannter Wandthermostate aktualisieren nun ebenfalls den gemeldeten Zustand.
+Fehlende Felder bleiben erhalten; ACK-Zuordnung und optimistische Wünsche bleiben
+unabhängig davon. Empfangene Meldungen erzeugen keine erneuten Sollwertsendungen.
+
+Die Raumansicht zeigt die **gespeicherte Konfiguration**, keinen Geräte-Readback.
+Bei einer einzelnen Eco-Änderung enthält das gemeinsame Konfigurationspaket auch
+die übrigen gespeicherten Parameter, gegebenenfalls deren bisherige Vorgaben.
+Es gibt keine zusätzliche Bestätigungsabfrage. Raumkopien sind nicht enthalten.
+
+Eingebettete ACK-Zustände werden nur bei einem positiven ACK übernommen, das zur
+aktiven Anfrage einschließlich Absender, Empfänger, Nachrichtenzähler und Frist
+passt. Verspätete, doppelte oder unzuordenbare ACKs verändern die Anzeige nicht.
+Eigenständige Statusmeldungen werden weiterhin unabhängig davon verarbeitet.

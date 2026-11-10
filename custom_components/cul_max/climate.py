@@ -244,7 +244,10 @@ class CulMaxClimate(ClimateEntity):
         elif hvac_mode == HVACMode.AUTO:
             await self._coordinator.async_set_temperature(self._address, 0.0, mode=MODE_AUTO)
         elif hvac_mode == HVACMode.HEAT:
-            temperature = self._coordinator.get_display_state(self._address)["target_temperature"]
+            state = self._coordinator.get_display_state(self._address)
+            temperature = state["target_temperature"]
+            if state["hvac_mode"] == "off":
+                temperature = self._device.last_normal_target or 20.0
             if temperature is None:
                 raise ServiceValidationError("Solltemperatur unbekannt; zuerst eine Temperatur angeben.")
             await self._coordinator.async_set_temperature(self._address, temperature, mode=MODE_MANUAL)

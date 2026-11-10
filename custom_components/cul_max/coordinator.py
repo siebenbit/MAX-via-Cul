@@ -12,7 +12,7 @@ import logging
 import math
 import re
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,7 @@ from .const import (
     MODE_VACATION,
     MODE_BOOST,
     TEMP_MIN,
+    TEMP_MAX,
     MSG_PAIR_PING,
     MSG_ACK,
     MSG_TIME_INFORMATION,
@@ -67,6 +68,7 @@ from .protocol import (
     build_set_temperature,
     build_shutter_contact_state,
     build_wake_up,
+    decode_max_until_datetime,
     decode_wall_thermostat_control,
     decode_shutter_contact_state,
     decode_thermostat_state,
@@ -181,6 +183,7 @@ class KnownDevice:
     window_open_temperature: float = 12.0
     window_open_duration: int = 15
     last_state: dict[str, Any] = field(default_factory=dict)
+    last_normal_target: float | None = None
     # Runtime-only knowledge from positive ACKs; never persisted as a report.
     acknowledged_state: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -1458,8 +1461,32 @@ class CulMaxCoordinator:
         elif msg.msg_type == MSG_TIME_INFORMATION:
             await self._handle_time_information(msg)
 
+        elif msg.msg_type == 0x40 and source_device and source_device.device_type == DEVICE_WALL_THERMOSTAT:
+            if msg.payload:
+                mode = msg.payload[0] >> 6
+                state = {"mode": mode}
+                target = (msg.payload[0] & 0x3F) / 2
+                if TEMP_MIN <= target <= TEMP_MAX:
+                    state["desired_temperature"] = target
+                if mode != MODE_VACATION:
+                    state["until"] = None
+                elif len(msg.payload) >= 4:
+                    until = decode_max_until_datetime(*msg.payload[1:4])
+                    if until is not None:
+                        state["until"] = until
+                await self._update_device_state(msg.src_hex, state)
+
         elif msg.msg_type == MSG_ACK:
-            self._handle_ack(msg)
+            accepted = self._handle_ack(msg)
+            # Embedded state belongs to this transaction, not an unsolicited
+            # report. Old, duplicate or unrelated ACKs must not roll state back.
+            if accepted and source_device:
+                kind = (0x70 if source_device.device_type == DEVICE_WALL_THERMOSTAT
+                        else 0x60 if source_device.device_type in CLIMATE_DEVICE_TYPES else None)
+                if kind is not None and len(msg.payload) >= 4:
+                    decoded = decode_thermostat_state(replace(msg, msg_type=kind, payload=msg.payload[1:]))
+                    if decoded:
+                        await self._update_device_state(msg.src_hex, decoded.as_reported_state())
 
         self._log_decoded_message(msg, decoded)
 
@@ -1529,31 +1556,32 @@ class CulMaxCoordinator:
         for cb in self._global_listeners:
             self.hass.loop.call_soon(cb, msg, decoded)
 
-    def _handle_ack(self, msg: MaxMessage) -> None:
-        """Resolve the pending ACK future if the incoming ACK matches."""
+    def _handle_ack(self, msg: MaxMessage) -> bool:
+        """Return True only for an accepted positive ACK of the active transaction."""
         pending = self._pending_ack
         if pending is None or pending.future.done():
-            return
+            return False
         if pending.deadline is not None and self.hass.loop.time() > pending.deadline:
-            return
+            return False
         expected_dst = pending.expected_dst or f"{self.own_address:06X}"
         if msg.dst_hex != expected_dst:
-            return
+            return False
         if pending.counter != msg.counter:
-            return
+            return False
         if pending.expected_src and pending.expected_src != msg.src_hex:
-            return
+            return False
         if not msg.payload:
             _LOGGER.warning("Ignoring empty ACK from %s", msg.src_hex)
-            return
+            return False
         if msg.payload[0] & 0x80:
             if pending.temperature_intent is not None:
                 pending.temperature_intent.entry.delivery_rejected = True
             pending.future.set_exception(_CommandRejected(f"Command rejected by {msg.src_hex}"))
-            return
+            return False
         if pending.temperature_intent is not None:
             self._acknowledge_temperature_intent(pending.temperature_intent)
         pending.future.set_result(msg)
+        return True
 
     # ------------------------------------------------------------------
     # Pairing
@@ -1883,6 +1911,8 @@ class CulMaxCoordinator:
                 device.acknowledged_state.pop("desired_temperature", None)
             device.acknowledged_state.update(accepted)
             intent.reported_fields.clear()
+        if intent.display_temperature is not None and intent.temperature > TEMP_MIN:
+            device.last_normal_target = intent.display_temperature
         intent.overlay = False
         self._notify_temperature_updated(intent.address)
 
@@ -2130,8 +2160,14 @@ class CulMaxCoordinator:
 
     async def _sync_pending_config_reading(self, address: str) -> None:
         """Mirror queued config and its job metadata into persistent storage."""
-        self._ensure_config_jobs()
+        self._refresh_pending_config_reading(address)
+        await self._save_devices()
         self._command_queue.notify()
+        self._notify_diagnostics_updated(address)
+
+    def _refresh_pending_config_reading(self, address: str) -> None:
+        """Update derived queue metadata without storage or callbacks."""
+        self._ensure_config_jobs()
         device = self.get_device(address)
         if device is None:
             return
@@ -2144,8 +2180,6 @@ class CulMaxCoordinator:
             for command in self._pending_climate_config.get(address.upper(), [])
         )
         device.pending_config = pending_descriptions
-        await self._save_devices()
-        self._notify_diagnostics_updated(address)
 
     def _now_iso(self) -> str:
         """Return the current UTC timestamp as ISO string."""
@@ -4950,6 +4984,9 @@ class CulMaxCoordinator:
         if address in self._devices:
             device = self._devices[address]
             state = dict(state)
+            target = state.get("desired_temperature")
+            if isinstance(target, (int, float)) and TEMP_MIN < target <= TEMP_MAX:
+                device.last_normal_target = target
             for key in state:
                 device.acknowledged_state.pop(key, None)
             if device.device_type in CLIMATE_DEVICE_TYPES:
@@ -5214,11 +5251,18 @@ class CulMaxCoordinator:
                 window_open_temperature=float(d.get("window_open_temperature", 12.0)),
                 window_open_duration=int(d.get("window_open_duration", 15)),
                 last_state=d.get("last_state", {}),
+                last_normal_target=d.get("last_normal_target"),
                 last_time_sync_at=d.get("last_time_sync_at", ""),
                 last_reported_time=d.get("last_reported_time", ""),
                 last_time_offset_seconds=d.get("last_time_offset_seconds"),
                 time_slot=int(d.get("time_slot", -1)),
             )
+            device = self._devices[addr]
+            candidate = device.last_normal_target
+            if candidate is None:
+                candidate = device.last_state.get("desired_temperature")
+            device.last_normal_target = (float(candidate) if isinstance(candidate, (int, float))
+                                         and TEMP_MIN < candidate <= TEMP_MAX else None)
             if self._devices[addr].device_type == DEVICE_WALL_THERMOSTAT:
                 state = self._devices[addr].last_state
                 previous_state = dict(state)
@@ -5314,6 +5358,7 @@ class CulMaxCoordinator:
                     "window_open_temperature": d.window_open_temperature,
                     "window_open_duration": d.window_open_duration,
                     "last_state": d.last_state,
+                    "last_normal_target": d.last_normal_target,
                     "last_time_sync_at": d.last_time_sync_at,
                     "last_reported_time": d.last_reported_time,
                     "last_time_offset_seconds": d.last_time_offset_seconds,

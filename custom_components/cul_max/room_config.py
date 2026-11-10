@@ -151,6 +151,14 @@ class RoomConfigManager:
             if previous:
                 if any(job.get("request_hash") != request_hash for job in previous):
                     raise ValueError("Auftrags-ID gehört zu anderen Änderungen")
+                ids = {job["id"] for job in previous}
+                for c in self.controllers.values():
+                    for address, queue in c._pending_climate_config.items():
+                        for command in queue:
+                            if command.job_id in ids:
+                                command.admitted = True
+                        if any(command.job_id in ids for command in queue):
+                            c._schedule_climate_config_processing(address, trigger="room_replay")
                 return {"operation_id": operation_id, "job_ids": [job["id"] for job in previous], "status": "accepted"}
             room = next((r for r in self.snapshot()["rooms"] if r["id"] == area_id), None)
             if room is None:
@@ -226,6 +234,8 @@ class RoomConfigManager:
                 c._ensure_config_jobs()
                 c._config_jobs[commands[0].job_id].update(operation_id=operation_id, request_hash=request_hash,
                                                         area_id=area_id, block=block, operation_size=len(plans))
+            for c, address, _, _ in plans:
+                c._refresh_pending_config_reading(address)
             touched = {c for c, _, _, _ in plans}
             try:
                 for c in touched:
@@ -241,8 +251,18 @@ class RoomConfigManager:
                             del c._pending_climate_config[address]
                     for job_id in ids:
                         c._config_jobs.pop(job_id, None)
-                await asyncio.gather(*(c._save_devices() for c in touched), return_exceptions=True)
+                for c, address, _, _ in plans:
+                    c._refresh_pending_config_reading(address)
+                rollback = await asyncio.gather(*(c._save_devices() for c in touched), return_exceptions=True)
+                if any(isinstance(result, BaseException) for result in rollback):
+                    raise OSError("Speicherfehler: Annahme des Auftrags unklar; gespeicherten Stand nach Wiederherstellung prüfen")
                 raise
+            # Release the entire durable operation before any notification can fail.
+            for _, _, _, commands in plans:
+                for command in commands:
+                    command.admitted = True
+            for c, address, _, _ in plans:
+                c._schedule_climate_config_processing(address, trigger="room_save")
             for item in room["devices"]:
                 c = self.controllers[item["config_entry_id"]]
                 draft = c._config_drafts.get(item["address"], {})
@@ -256,12 +276,6 @@ class RoomConfigManager:
                     c._config_drafts.pop(item["address"], None)
                 c._notify_diagnostics_updated(item["address"])
                 c._notify_week_profile_updated(item["address"])
-            for c, address, _, commands in plans:
-                for command in commands:
-                    command.admitted = True
-                await c._sync_pending_config_reading(address)
-                c._notify_week_profile_updated(address)
-                c._schedule_climate_config_processing(address, trigger="room_save")
             return {"operation_id": operation_id, "job_ids": [cmds[0].job_id for _, _, _, cmds in plans],
                     "status": "accepted" if plans else "unchanged"}
 

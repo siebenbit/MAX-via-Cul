@@ -974,3 +974,29 @@ Public admin interfaces:
 through `sunday` to existing day strings such as `17,06:00,21,22:00,17`. Revisions
 come from the snapshot. Keep the same ID and payload when retrying a save after
 connection loss. No new runtime dependencies or real RF tests are required.
+
+
+### Configuration admission and thermostat state fixes
+
+Persisted room operations release all their steps together after storage succeeds.
+Replaying the same operation ID wakes pending work without creating duplicate jobs.
+A storage failure with a failed rollback explicitly reports an uncertain outcome.
+
+OFF still means manual mode at 4.5 °C (frost protection). Returning to Manual uses
+the last reported or positively acknowledged target above 4.5 °C, falling back to
+20 °C. Unsent and unconfirmed wishes do not replace this persisted return target.
+
+Positive ACKs with embedded state and incoming SetTemperature messages from known
+wall thermostats also update reported state. Missing fields are preserved; command
+ACK matching and pending optimistic wishes remain independent. Reports never
+trigger automatic target retransmissions.
+
+The room editor displays **stored configuration**, not configuration readback.
+Changing only Eco sends the combined packet with all other stored parameters,
+including existing defaults where applicable. No additional confirmation is required.
+Copying configuration between rooms is not included.
+
+Embedded ACK state is accepted only for a positive ACK matching the active
+transaction, including source, destination, counter and deadline. Late, duplicate
+or unrelated ACKs cannot change the display. Unsolicited state reports remain
+independent of command ACK matching.
