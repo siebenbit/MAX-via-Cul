@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,10 +92,11 @@ WEEK_PROFILE_ACK_RETRIES = 5
 WEEK_PROFILE_PART_DELAY = 0.35
 WEEK_PROFILE_DAY_DELAY = 0.75
 RECONNECT_WAIT_TIMEOUT = 12.0
-CUL_CREDIT_MAX = 180.0
-CUL_CREDIT_RECOVERY_PER_SECOND = 1.0
-CUL_CREDIT_PREAMBLE_COST = 100.0
-CUL_CREDIT_FALLBACK_WAIT = 5.0
+CUL_CREDIT_MAX = 900
+CUL_CREDIT_QUERY_TIMEOUT = 3.0
+CUL_CREDIT_RESERVE = 1
+CUL_CREDIT_RETRY_MIN = 5.0
+CUL_CREDIT_RETRY_MAX = 60.0
 PERIODIC_TIME_SYNC_INTERVAL = 3600.0
 PERIODIC_TIME_SYNC_MIN_AGE = timedelta(minutes=55)
 STARTUP_TIME_SYNC_INITIAL_DELAY = 90.0
@@ -177,6 +179,7 @@ class PendingAck:
     expected_src: str | None
     future: asyncio.Future[MaxMessage]
     description: str
+    deadline: float | None = None
 
 
 @dataclass
@@ -190,6 +193,18 @@ class CommandRequest:
     retries: int
     timeout: float
     future: asyncio.Future[MaxMessage | None]
+
+
+@dataclass
+class RadioRequest:
+    """One raw RF write; the command worker still owns device ACK retries."""
+    cmd: str
+    priority: bool
+    sequence: int
+    future: asyncio.Future[None]
+    before_send: Callable[[], None] | None = None
+    ack_future: asyncio.Future[MaxMessage] | None = None
+    written: bool = False
 
 
 @dataclass
@@ -367,8 +382,24 @@ class CulMaxCoordinator:
         self._pending_climate_config: dict[str, list[PendingClimateCommand]] = {}
         self._pending_climate_tasks: dict[str, asyncio.Task] = {}
         self._config_drafts: dict[str, dict[str, Any]] = {}
-        self._cul_credit_estimate: float = CUL_CREDIT_MAX
-        self._cul_credit_updated_at: float = 0.0
+        self._credit_response: asyncio.Future[int] | None = None
+        self._credit_reported: int | None = None
+        self._credit_query_at: str | None = None
+        self._credit_valid = False
+        self._credit_error: str | None = None
+        self._credit_backoff = CUL_CREDIT_RETRY_MIN
+        self._credit_retry_at = 0.0
+        self._radio_requests: list[RadioRequest] = []
+        self._radio_sequence = 0
+        self._radio_task: asyncio.Task | None = None
+        self._radio_changed = asyncio.Event()
+        self._connection_ready = asyncio.Event()
+        self._connection_generation = 0
+        self._reconnect_task: asyncio.Task | None = None
+        self._rx_response_tasks: set[asyncio.Task] = set()
+        self._budget_listeners: list[Callable[[], None]] = []
+        self._credit_wait_until = 0.0
+        self._credit_lovf = False
 
         self._devices: dict[str, KnownDevice] = {}
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
@@ -901,6 +932,20 @@ class CulMaxCoordinator:
         """Close the TCP connection cleanly."""
         self._shutting_down = True
         self._reconnecting = False
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            await asyncio.gather(self._reconnect_task, return_exceptions=True)
+            self._reconnect_task = None
+        for task in list(self._rx_response_tasks):
+            task.cancel()
+        await asyncio.gather(*self._rx_response_tasks, return_exceptions=True)
+        if self._radio_task:
+            self._radio_task.cancel()
+            await asyncio.gather(self._radio_task, return_exceptions=True)
+            self._radio_task = None
+        for request in self._radio_requests:
+            request.future.cancel()
+        self._radio_requests.clear()
         if self._polling_task:
             self._polling_task.cancel()
             try:
@@ -980,8 +1025,6 @@ class CulMaxCoordinator:
                 timeout=10.0,
             )
             self._reconnect_delay = RECONNECT_DELAY_MIN
-            self._cul_credit_estimate = CUL_CREDIT_MAX
-            self._cul_credit_updated_at = self.hass.loop.time()
             _LOGGER.info("Connected to CULFW at %s:%d", self.host, self.port)
         except (OSError, asyncio.TimeoutError) as e:
             _LOGGER.error("Cannot connect to CULFW at %s:%d — %s", self.host, self.port, e)
@@ -999,11 +1042,33 @@ class CulMaxCoordinator:
             await self._close_connection()
             return False
 
-        self._read_task = self.hass.loop.create_task(self._read_loop())
+        self._read_task = self.hass.loop.create_task(
+            self._read_loop(self._reader, self._connection_generation)
+        )
+        # Synchronize even when there is no pending RF work. A failed query
+        # leaves HA loaded for diagnosis, but never grants permission to send.
+        async with self._cul_credit_lock:
+            delay = max(0.0, self._credit_retry_at - self.hass.loop.time())
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._query_credit()
+                self._credit_error = None
+            except (TimeoutError, OSError, ConnectionError) as err:
+                self._budget_failure(str(err) or "Credit query timed out")
+        if self._writer is not None:
+            self._connection_ready.set()
+        self._radio_changed.set()
         return True
 
     async def _close_connection(self) -> None:
         """Close the current TCP connection if one exists."""
+        if self._credit_response is not None and not self._credit_response.done():
+            self._credit_response.set_exception(ConnectionError("CUL disconnected during credit query"))
+        self._connection_generation += 1
+        self._connection_ready.clear()
+        self._credit_valid = False
+        self._notify_budget_updated()
         writer = self._writer
         self._reader = None
         self._writer = None
@@ -1019,15 +1084,22 @@ class CulMaxCoordinator:
         if self._shutting_down or self._reconnecting:
             return
         self._reconnecting = True
-        self.hass.loop.create_task(self._reconnect_loop())
+        self._reconnect_task = self.hass.loop.create_task(self._reconnect_loop())
 
-    async def _read_loop(self) -> None:
-        """Continuously read lines from CULFW and dispatch MAX! messages."""
-        assert self._reader is not None
+    async def _read_loop(
+        self, reader: asyncio.StreamReader | None = None, generation: int | None = None,
+    ) -> None:
+        """Continuously read lines from one connection generation."""
+        reader = reader if reader is not None else self._reader
+        if reader is None:
+            return
+        generation = self._connection_generation if generation is None else generation
         _LOGGER.debug("CUL read loop started")
         try:
             while True:
-                line_bytes = await self._reader.readline()
+                line_bytes = await reader.readline()
+                if generation != self._connection_generation:
+                    return
                 if not line_bytes:
                     _LOGGER.warning("CULFW connection closed by remote host")
                     break
@@ -1035,7 +1107,7 @@ class CulMaxCoordinator:
                 if not line:
                     continue
                 _LOGGER.debug("CUL RX: %s", line)
-                await self._handle_line(line)
+                await self._handle_line(line, generation=generation)
         except asyncio.CancelledError:
             return
         except ConnectionResetError as e:
@@ -1046,8 +1118,9 @@ class CulMaxCoordinator:
             _LOGGER.exception("CUL read loop error")
 
         # Connection lost — try to reconnect
-        await self._close_connection()
-        self._schedule_reconnect()
+        if generation == self._connection_generation:
+            await self._close_connection()
+            self._schedule_reconnect()
 
     async def _reconnect_loop(self) -> None:
         """Keep attempting reconnection until successful."""
@@ -1058,7 +1131,7 @@ class CulMaxCoordinator:
                 self.host, self.port, delay,
             )
             await asyncio.sleep(delay)
-            if await self._connect():
+            if await self._connect() and self._writer is not None:
                 self._reconnecting = False
                 _LOGGER.info("Reconnected to CULFW at %s:%d", self.host, self.port)
                 self._resume_pending_config_processing()
@@ -1123,15 +1196,26 @@ class CulMaxCoordinator:
         last_error: Exception | None = None
         for attempt in range(1, request.retries + 2):
             future: asyncio.Future[MaxMessage] = self.hass.loop.create_future()
-            self._pending_ack = PendingAck(
-                counter=request.counter,
-                expected_src=request.expected_src.upper() if request.expected_src else None,
-                future=future,
-                description=request.description,
-            )
+            sent_at = 0.0
+
+            def arm_ack() -> None:
+                nonlocal sent_at
+                sent_at = self.hass.loop.time()
+                self._pending_ack = PendingAck(
+                    counter=request.counter,
+                    expected_src=request.expected_src.upper() if request.expected_src else None,
+                    future=future,
+                    description=request.description,
+                    deadline=sent_at + request.timeout,
+                )
+
             try:
-                await self._send_raw(request.cmd)
-                ack = await asyncio.wait_for(future, timeout=request.timeout)
+                await self._send_raw(request.cmd, before_send=arm_ack, ack_future=future)
+                if future.done():
+                    ack = future.result()
+                else:
+                    remaining = max(0.0, sent_at + request.timeout - self.hass.loop.time())
+                    ack = await asyncio.wait_for(future, timeout=remaining)
                 self._pending_ack = None
                 if request.device_address:
                     await self._mark_command_success(
@@ -1187,8 +1271,28 @@ class CulMaxCoordinator:
     # Message handling
     # ------------------------------------------------------------------
 
-    async def _handle_line(self, line: str) -> None:
+    async def _handle_line(self, line: str, *, generation: int | None = None) -> None:
         """Parse and dispatch a received CULFW line."""
+        if line == "LOVF":
+            self._credit_lovf = True
+            self._credit_valid = False
+            self._notify_budget_updated()
+            _LOGGER.warning("CUL rejected RF transmission: LOVF")
+            return
+        if re.fullmatch(r"[0-9A-Fa-f]{2} *[0-9]{1,5}", line):
+            credits = int(line[2:].strip())
+            pending = self._credit_response
+            if pending is not None and not pending.done() and 0 <= credits <= CUL_CREDIT_MAX:
+                self._credit_reported = credits
+                self._credit_query_at = datetime.now(UTC).isoformat()
+                self._credit_valid = True
+                pending.set_result(credits)
+                self._notify_budget_updated()
+            return
+        if line.startswith(("LENERR", "ZERR", "Z ERR")):
+            self._credit_error = line
+            self._notify_budget_updated()
+            return
         if line.startswith("V"):
             _LOGGER.info("CULFW version: %s", line)
             return
@@ -1201,13 +1305,15 @@ class CulMaxCoordinator:
         if msg is None:
             return
         await self._touch_device(msg.src_hex)
+        if generation is not None and generation != self._connection_generation:
+            return
         source_device = self.get_device(msg.src_hex)
 
         decoded: ThermostatState | ShutterContactState | None = None
 
         if msg.msg_type == MSG_PAIR_PING:
             if self._pairing_mode:
-                await self._handle_pair_ping(msg)
+                self._schedule_rx_response(self._handle_pair_ping(msg))
             else:
                 _LOGGER.info(
                     "PairPing from %s ignored because pairing mode is not active",
@@ -1286,7 +1392,7 @@ class CulMaxCoordinator:
                 "TimeInformation request from %s without payload; sending current local time",
                 self._format_device_identity(msg.src_hex),
             )
-            await self.async_send_time_information(msg.src_hex)
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
             return
 
         if parsed is None:
@@ -1294,7 +1400,7 @@ class CulMaxCoordinator:
                 "TimeInformation from %s has invalid payload; sending corrected time",
                 self._format_device_identity(msg.src_hex),
             )
-            await self.async_send_time_information(msg.src_hex)
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
             return
 
         if abs(offset_seconds) > 5:
@@ -1303,7 +1409,7 @@ class CulMaxCoordinator:
                 self._format_device_identity(msg.src_hex),
                 offset_seconds,
             )
-            await self.async_send_time_information(msg.src_hex)
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
 
     def _dispatch(self, msg: MaxMessage, decoded: Any) -> None:
         """Call all registered listeners for this message."""
@@ -1317,6 +1423,8 @@ class CulMaxCoordinator:
         """Resolve the pending ACK future if the incoming ACK matches."""
         pending = self._pending_ack
         if pending is None or pending.future.done():
+            return
+        if pending.deadline is not None and self.hass.loop.time() > pending.deadline:
             return
         if pending.counter != msg.counter:
             return
@@ -1352,13 +1460,13 @@ class CulMaxCoordinator:
         src = msg.src_hex
         _LOGGER.info("PairPing from new device %s (payload: %s)", src, msg.payload.hex())
 
-        # Pairing responses must go out immediately. Running PairPong through the
+        # Pairing responses get priority at the next RF admission opportunity. Running PairPong through the
         # normal serialized command queue can delay it behind config traffic and
         # cause pairing timeouts on real devices.
         counter = self._next_counter()
         cmd = build_pair_pong(counter, self.own_address, msg.src)
         await self._send_raw(cmd, priority=True)
-        _LOGGER.info("Sent PairPong immediately to %s", src)
+        _LOGGER.info("Sent priority PairPong to %s", src)
 
         # PairPing payload seen on real devices starts with an extra leading byte
         # before the actual device type. Older parsing treated that byte as the
@@ -1384,7 +1492,7 @@ class CulMaxCoordinator:
         # Keep the read loop free for additional PairPing telegrams. Device
         # persistence, entity dispatch, and initial time sync can happen in a
         # short follow-up task after the critical PairPong has been sent.
-        self.hass.loop.create_task(
+        self._schedule_rx_response(
             self._finalize_pair_ping(
                 msg=msg,
                 src=src,
@@ -3514,28 +3622,216 @@ class CulMaxCoordinator:
         )
         return await future
 
-    async def _send_raw(self, cmd: str, *, priority: bool = False) -> None:
-        """Write a raw CULFW command string over TCP."""
-        if self._writer is None:
-            _LOGGER.warning("Cannot send immediately because CULFW is disconnected, waiting for reconnect")
-            await self._ensure_connected()
-        cmd = self._refresh_time_information_command(cmd)
-        await self._reserve_cul_credit_for_command(cmd, priority=priority)
+    def _schedule_rx_response(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        """Keep receive-triggered replies out of the only TCP reader."""
+        if self._shutting_down:
+            coroutine.close()
+            return
+        task = self.hass.loop.create_task(coroutine)
+        self._rx_response_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._rx_response_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                _LOGGER.error("Receive-triggered response failed: %s", done.exception())
+
+        task.add_done_callback(finished)
+
+    def add_budget_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Subscribe to controller-wide credit diagnostics."""
+        self._budget_listeners.append(listener)
+        return lambda: self._budget_listeners.remove(listener)
+
+    def _notify_budget_updated(self) -> None:
+        for listener in self._budget_listeners:
+            listener()
+
+    def get_budget_diagnostics(self) -> dict[str, Any]:
+        """Expose measured values separately from scheduling estimates."""
+        pending = self._next_radio_request()
+        cost = self._estimate_cul_credit_cost(pending.cmd) if pending else None
+        wait = max(0.0, self._credit_wait_until - self.hass.loop.time())
+        return {
+            "reported_credits": self._credit_reported,
+            "budget_valid": self._credit_valid,
+            "next_packet_cost": cost,
+            "required_credits": cost + CUL_CREDIT_RESERVE if cost is not None else None,
+            "waiting_for_budget": bool(pending and (wait > 0 or not self._credit_valid)),
+            "retry_in_seconds": wait,
+            "next_attempt_at": (datetime.now(UTC) + timedelta(seconds=wait)).isoformat() if wait else None,
+            "last_budget_query_at": self._credit_query_at,
+            "last_budget_error": self._credit_error,
+            "waiting_packets": len(self._radio_requests) + self._command_queue.qsize(),
+        }
+
+    async def _write_cul(
+        self, cmd: str, before_send: Callable[[], None] | None = None,
+    ) -> None:
+        """Write without reading; only the receive loop owns the reader."""
         async with self._send_lock:
             if self._writer is None:
-                _LOGGER.warning("CULFW disconnected while waiting to send, reconnecting")
-                await self._ensure_connected()
-            if not cmd.endswith("\n"):
-                cmd += "\n"
-            _LOGGER.debug("CUL TX: %s", cmd.strip())
+                raise ConnectionError("CUL disconnected")
             try:
-                self._writer.write(cmd.encode("ascii"))
+                if before_send:
+                    before_send()
+                _LOGGER.debug("CUL TX: %s", cmd.strip())
+                self._writer.write((cmd.rstrip() + "\n").encode("ascii"))
                 await self._writer.drain()
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                _LOGGER.warning("CULFW send failed: %s", e)
+            except (OSError, ConnectionError):
                 await self._close_connection()
                 self._schedule_reconnect()
                 raise
+
+    async def _query_credit(self) -> int:
+        """Called under the credit lock; close ambiguous streams on timeout."""
+        future: asyncio.Future[int] = self.hass.loop.create_future()
+        self._credit_response = future
+        try:
+            async with asyncio.timeout(CUL_CREDIT_QUERY_TIMEOUT):
+                await self._write_cul("X")
+                return await future
+        except (TimeoutError, OSError, ConnectionError):
+            await self._close_connection()
+            self._schedule_reconnect()
+            raise
+        finally:
+            if not future.done():
+                future.cancel()
+            if future.done() and not future.cancelled():
+                future.exception()  # Also consume failures raised while writing X.
+            if self._credit_response is future:
+                self._credit_response = None
+
+    def _budget_failure(self, message: str) -> None:
+        self._credit_valid = False
+        self._credit_error = message
+        self._credit_retry_at = self.hass.loop.time() + self._credit_backoff
+        self._credit_wait_until = self._credit_retry_at
+        self._credit_backoff = min(CUL_CREDIT_RETRY_MAX, self._credit_backoff * 2)
+        _LOGGER.warning(
+            "CUL RF paused: %s; retry in %.1fs",
+            message, self._credit_wait_until - self.hass.loop.time(),
+        )
+        self._notify_budget_updated()
+
+    def _next_radio_request(self) -> RadioRequest | None:
+        live = [request for request in self._radio_requests if not request.future.done()]
+        return (
+            min(live, key=lambda request: (not request.priority, request.sequence))
+            if live else None
+        )
+
+    async def _send_raw(
+        self, cmd: str, *, priority: bool = False,
+        before_send: Callable[[], None] | None = None,
+        ack_future: asyncio.Future[MaxMessage] | None = None,
+    ) -> None:
+        """Queue RF admission; priority affects order, never credit limits."""
+        if not self._estimate_cul_credit_cost(cmd):
+            await self._write_cul(cmd)
+            return
+        future: asyncio.Future[None] = self.hass.loop.create_future()
+        request = RadioRequest(cmd, priority, self._radio_sequence, future, before_send, ack_future)
+        self._radio_sequence += 1
+        self._radio_requests.append(request)
+        self._radio_changed.set()
+        if self._radio_task is None or self._radio_task.done():
+            self._radio_task = self.hass.loop.create_task(self._radio_worker())
+        self._notify_budget_updated()
+        try:
+            await future
+        finally:
+            if request in self._radio_requests:
+                self._radio_requests.remove(request)
+            self._radio_changed.set()
+            self._notify_budget_updated()
+
+    async def _radio_worker(self) -> None:
+        """One RF transaction at a time, independently of the ACK command queue.
+
+        A post-write X is an ordered firmware-processing barrier: LOVF has no
+        packet identifier, so no following RF frame may overtake this barrier.
+        Budget waits release the credit lock and can be interrupted by priority
+        arrivals. No local regeneration ever grants permission to transmit.
+        """
+        while not self._shutting_down:
+            request = self._next_radio_request()
+            if request is None:
+                return
+            # An ACK proves delivery even if the subsequent X barrier failed.
+            # Keep the global budget paused, but do not retransmit that frame.
+            ack = request.ack_future
+            if (
+                request.written and ack is not None and ack.done()
+                and not ack.cancelled() and ack.exception() is None
+            ):
+                request.future.set_result(None)
+                self._radio_requests.remove(request)
+                self._notify_budget_updated()
+                continue
+            self._radio_changed.clear()
+            delay = max(0.0, self._credit_retry_at - self.hass.loop.time())
+            try:
+                if delay <= 0:
+                    await self._ensure_connected()
+                    await self._connection_ready.wait()
+                    async with self._cul_credit_lock:
+                        # Connection synchronization may have set a backoff.
+                        if self.hass.loop.time() < self._credit_retry_at:
+                            continue
+                        credits = await self._query_credit()
+                        request = self._next_radio_request()
+                        if request is None:
+                            continue
+                        self._radio_changed.clear()
+                        cost = self._estimate_cul_credit_cost(request.cmd)
+                        if credits >= cost + CUL_CREDIT_RESERVE:
+                            self._credit_lovf = False
+                            self._credit_error = None
+                            await self._write_cul(
+                                self._refresh_time_information_command(request.cmd),
+                                before_send=request.before_send,
+                            )
+                            request.written = True
+                            await self._query_credit()
+                            if self._credit_lovf:
+                                request.written = False
+                                self._budget_failure("LOVF: firmware rejected transmission")
+                            elif self._credit_error and not request.future.done():
+                                request.future.set_exception(ConnectionError(self._credit_error))
+                            else:
+                                self._credit_backoff = CUL_CREDIT_RETRY_MIN
+                                self._credit_error = None
+                                self._credit_retry_at = 0.0
+                                self._credit_wait_until = 0.0
+                                if not request.future.done():
+                                    request.future.set_result(None)
+                                # Remove here too, before the caller resumes.
+                                if request in self._radio_requests:
+                                    self._radio_requests.remove(request)
+                            self._notify_budget_updated()
+                            continue
+                        self._credit_backoff = CUL_CREDIT_RETRY_MIN
+                        self._credit_error = None
+                        delay = cost + CUL_CREDIT_RESERVE - credits + 1.0
+                        self._credit_wait_until = self.hass.loop.time() + delay
+                        _LOGGER.info(
+                            "CUL budget waits %.1fs for %s: need %.0f + reserve %d, "
+                            "reported %d (priority=%s)",
+                            delay, request.cmd[:24], cost, CUL_CREDIT_RESERVE,
+                            credits, request.priority,
+                        )
+                        self._notify_budget_updated()
+                await asyncio.wait_for(self._radio_changed.wait(), timeout=delay)
+            except TimeoutError:
+                if self._writer is None:
+                    self._budget_failure("Credit query timed out")
+            except (OSError, ConnectionError) as err:
+                self._budget_failure(str(err))
+            except Exception as err:
+                _LOGGER.exception("CUL radio request failed")
+                if not request.future.done():
+                    request.future.set_exception(err)
 
     def _extract_culfw_packet_hex(self, cmd: str) -> str | None:
         """Return the raw MAX!/CUL packet hex from one send command."""
@@ -3564,58 +3860,20 @@ class CulMaxCoordinator:
         except ValueError:
             return cmd
         refreshed = build_time_information(counter, src, dst)
+        if cmd.strip().startswith("Zf"):
+            refreshed = "Zf" + refreshed[2:]
         _LOGGER.debug("Refreshed queued TimeInformation payload immediately before send")
         return refreshed
 
-    def _refresh_cul_credit_estimate(self) -> None:
-        """Recover estimated CUL send credits over time."""
-        now = self.hass.loop.time()
-        if self._cul_credit_updated_at == 0.0:
-            self._cul_credit_updated_at = now
-            return
-        elapsed = max(0.0, now - self._cul_credit_updated_at)
-        self._cul_credit_estimate = min(
-            CUL_CREDIT_MAX,
-            self._cul_credit_estimate + elapsed * CUL_CREDIT_RECOVERY_PER_SECOND,
-        )
-        self._cul_credit_updated_at = now
-
     def _estimate_cul_credit_cost(self, cmd: str) -> float:
-        """Estimate the CUL send cost using the same rough model FHEM uses."""
-        packet_hex = self._extract_culfw_packet_hex(cmd)
-        if not packet_hex:
+        """CULFW32 moritz_rf.cpp: includes length byte, integer division."""
+        packet = self._extract_culfw_packet_hex(cmd)
+        if packet is None:
             return 0.0
-        bit_cost = (len(packet_hex) * 4 + 9) // 10
-        return CUL_CREDIT_PREAMBLE_COST + float(bit_cost)
-
-    async def _reserve_cul_credit_for_command(self, cmd: str, *, priority: bool = False) -> None:
-        """Conservatively pace outgoing writes to avoid overwhelming the CUL."""
-        cost = self._estimate_cul_credit_cost(cmd)
-        if cost <= 0:
-            return
-        while True:
-            async with self._cul_credit_lock:
-                self._refresh_cul_credit_estimate()
-                if priority:
-                    self._cul_credit_estimate = max(0.0, self._cul_credit_estimate - cost)
-                    return
-                if self._cul_credit_estimate >= cost:
-                    self._cul_credit_estimate = max(0.0, self._cul_credit_estimate - cost)
-                    return
-                wait_time = max(
-                    CUL_CREDIT_FALLBACK_WAIT,
-                    (cost - self._cul_credit_estimate) + 1.0,
-                )
-                if priority:
-                    wait_time = min(wait_time, 0.5)
-                _LOGGER.info(
-                    "CUL credit pacing delays send by %.1fs (need %.1f, have %.1f)%s",
-                    wait_time,
-                    cost,
-                    self._cul_credit_estimate,
-                    " [priority]" if priority else "",
-                )
-            await asyncio.sleep(wait_time)
+        data = bytes.fromhex(packet)
+        if not data or data[0] + 1 != len(data):
+            raise ValueError("Invalid MAX packet length")
+        return float((0 if cmd.strip().startswith("Zf") else 100) + len(data) * 8 // 10)
 
     # ------------------------------------------------------------------
     # Device registry

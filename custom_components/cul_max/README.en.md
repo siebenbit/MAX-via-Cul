@@ -571,3 +571,52 @@ The reference files include these author and copyright notices:
 Home Assistant uses the `documentation` field in [manifest.json](manifest.json)
 to link to this integration's documentation. It currently points to the
 [English repository README](https://github.com/thnow/MAX-via-Cul/blob/main/README.md).
+
+## Radio budget
+
+The integration queries the actual controller credits with bare `X` on TCP
+connection and before every RF transmission. CULFW32 0.2.12 uses the same format
+as the inspected CULFW/a-culfw reference: two hexadecimal `TX_REPORT` characters
+followed by a five-column decimal credit field, for example `00  450`. The single
+TCP receive loop routes credit responses independently of MAX! frames and ACKs.
+Bare `X` does not change the RF mode.
+
+Firmware cost is `100 + (packet_bytes * 8) // 10` for `Zs`; `Zf` omits the 100-credit
+preamble cost. The length byte is included. Admission requires one additional
+credit as reserve. Existing wake-up behavior and packet prefixes are preserved.
+The firmware maximum of 900 and boot value of 450 are never assumed available
+on TCP reconnect. One credit represents 10 ms, regenerated at one credit per second.
+
+Insufficient credits leave the packet pending. The next query is scheduled after
+the deficit plus one second; estimated regeneration never authorizes transmission.
+There is no periodic idle polling. A further `X` after each RF frame acts as a
+firmware-processing barrier before the next frame: `LOVF` has no packet ID, so
+this ordering permits attribution to the current raw write. These TCP queries
+consume no RF credits. The barrier confirms firmware processing, not device reception.
+
+PairPong and virtual window contacts retain priority. Priority packets precede
+normal RF writes that have not started; each priority level uses FIFO order.
+An active RF transaction is not interrupted. Priority requires the same credits
+and reserve, so pairing with exhausted credits may require another attempt on
+the device. Receive-triggered replies wait outside the TCP reader. Device ACK
+matching is separate, and ACK deadlines start at the actual RF command write.
+
+Missing or malformed credit responses pause transmission. Queries time out after
+three seconds and close the TCP connection, preventing late responses from being
+assigned to later queries. Pending packets remain queued. Query failures and
+repeated `LOVF` use backoff of 5, 10, 20, 40 and at most 60 seconds. Budget waits
+do not consume device ACK retries. If a connection fails after writing a frame
+without a device ACK, delivery remains uncertain and a later repeat is possible.
+
+The controller's **CUL Credits** diagnostic sensor retains the last measured
+value; `budget_valid` identifies whether it is currently valid. Attributes include
+`next_packet_cost`, `required_credits`, `waiting_for_budget`, `retry_in_seconds`,
+`next_attempt_at`, `last_budget_query_at`, `last_budget_error` and `waiting_packets`.
+Historical readings after disconnection never grant permission to transmit.
+Times estimate the next check rather than guaranteeing transmission.
+
+Sources: [CULFW32 0.2.12 X query](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/frontend_culfw/src/frontend_culfw.cpp#L1266-L1285),
+[MAX! cost calculation](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/rf_proto_moritz/src/moritz_rf.cpp#L298-L307),
+[FHEM credit10ms](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/00_CUL.pm)
+and [FHEM MAX! queue](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm).
+Firmware returning an incompatible credit format cannot authorize RF writes.

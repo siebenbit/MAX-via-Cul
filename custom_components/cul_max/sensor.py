@@ -26,7 +26,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up diagnostic sensor entities for all known devices."""
     coordinator: CulMaxCoordinator = entry.runtime_data
-    entities: list[SensorEntity] = []
+    entities: list[SensorEntity] = [CulMaxCreditSensor(coordinator, entry.entry_id)]
     known_ids: set[str] = set()
 
     for device in coordinator.get_all_devices():
@@ -49,6 +49,49 @@ async def async_setup_entry(
 
     entry.async_on_unload(coordinator.add_global_listener(on_new_device))
     async_add_entities(entities)
+
+
+class CulMaxCreditSensor(SensorEntity):
+    """Measured controller budget; estimates are attributes only."""
+
+    _attr_has_entity_name = True
+    _attr_name = "CUL Credits"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:transmission-tower"
+    _attr_native_unit_of_measurement = "credits"
+
+    def __init__(self, coordinator: CulMaxCoordinator, entry_id: str) -> None:
+        self._coordinator = coordinator
+        self._attr_unique_id = f"{DOMAIN}_{entry_id}_cul_credit"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"controller_{coordinator.host}:{coordinator.port}")},
+            name=f"MAX! CUL ({coordinator.host}:{coordinator.port})",
+            manufacturer="eQ-3 / CULFW",
+            model="MAX! via CUL",
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        return self._coordinator.get_budget_diagnostics()["reported_credits"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._coordinator.get_budget_diagnostics()
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._coordinator.add_budget_listener(self._on_budget_update))
+        self.async_on_remove(async_track_time_interval(
+            self.hass, self._on_timer, timedelta(seconds=1),
+        ))
+
+    @callback
+    def _on_budget_update(self) -> None:
+        self.async_write_ha_state()
+
+    @callback
+    def _on_timer(self, _now) -> None:
+        if self.extra_state_attributes["waiting_packets"]:
+            self.async_write_ha_state()
 
 
 class CulMaxLastSeenSensor(SensorEntity):

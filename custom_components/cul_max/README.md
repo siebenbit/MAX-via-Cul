@@ -825,3 +825,59 @@ Sobald das Projekt in GitHub liegt, sollte dieses Feld auf die echte README oder
 ```json
 "documentation": "https://github.com/DEIN-NAME/cul_max/blob/main/README.md"
 ```
+
+## Funkbudget
+
+Der Controller wird beim TCP-Verbindungsaufbau und vor jeder Funkübertragung mit
+`X` nach seinen tatsächlichen Credits gefragt. CULFW32 0.2.12 verwendet dasselbe
+Format wie die geprüfte CULFW/a-culfw-Referenz: zwei Hexzeichen für `TX_REPORT`,
+gefolgt von einem fünf Stellen breiten Dezimalfeld, beispielsweise `00  450`.
+Es gibt nur einen TCP-Empfangsloop; Budgetantworten und MAX!-ACKs werden dort
+getrennt zugeordnet. `X` ohne Argument verändert den Funkmodus nicht.
+
+Die Firmwarekosten entsprechen `100 + (Paketbytes * 8) // 10` für `Zs`; bei `Zf`
+entfällt der Präambelanteil. Das Längenbyte zählt mit. Zur Freigabe muss zusätzlich
+ein Credit Reserve vorhanden sein. Das bisherige Wake-up-Verhalten und die
+verwendeten Paketpräfixe bleiben erhalten. Maximal 900 Credits und 450 Credits
+beim Firmwarestart sind Firmwarewerte, keine beim TCP-Reconnect angenommenen
+Guthaben. Ein Credit entspricht 10 ms, die Regeneration einem Credit pro Sekunde.
+
+Bei Budgetmangel bleibt das Paket ausstehend. Die nächste Abfrage erfolgt nach
+fehlenden Credits plus einer Sekunde; lokale Regeneration erteilt niemals allein
+eine Sendefreigabe. Im Leerlauf erfolgen keine periodischen Budgetabfragen. Eine
+zusätzliche `X`-Abfrage nach jedem Funkpaket bildet eine Verarbeitungsbarriere:
+Da `LOVF` keine Paketkennung enthält, wird erst danach das nächste Funkpaket
+zugelassen. Diese TCP-Abfragen verbrauchen keine Funkcredits. Die Barriere
+bestätigt die Firmwareverarbeitung, nicht den Empfang durch das MAX!-Gerät.
+
+PairPong und virtuelle Fensterkontakte verwenden die bestehende Priorität.
+Priorisierte Pakete werden vor noch nicht begonnenen normalen Funkpaketen
+gewählt; innerhalb derselben Priorität gilt FIFO. Laufende Sendungen werden
+nicht unterbrochen. Jede Priorität benötigt das volle Budget einschließlich
+Reserve. Pairing kann bei erschöpftem Budget deshalb weiterhin einen erneuten
+Versuch am Gerät erfordern. Empfangsabhängige Antworten warten außerhalb des
+Empfangsloops. Geräte-ACKs behalten ihre eigene Zuordnung; ACK-Fristen starten
+erst beim tatsächlichen Schreiben des Funkpakets.
+
+Fehlende oder ungültige Budgetantworten geben keinen Versand frei. Nach drei
+Sekunden wird eine Abfrage abgebrochen und die TCP-Verbindung erneuert, damit
+verspätete Antworten nicht einer neuen Abfrage zugeordnet werden. Wartende
+Pakete bleiben ausstehend. Abfragefehler und wiederholtes `LOVF` verwenden
+Wartezeiten von 5, 10, 20, 40 bis maximal 60 Sekunden. Budgetwarten verbraucht
+keine Geräte-ACK-Retries. Bei Verbindungsausfall nach einer Sendung bleibt deren
+Zustellung ohne Geräte-ACK ungewiss; eine spätere Wiederholung ist möglich.
+
+Am Controller-Gerät steht der Diagnose-Sensor **CUL Credits** bereit. Sein Zustand
+ist der zuletzt gemeldete Wert; `budget_valid` zeigt dessen aktuelle Gültigkeit.
+Weitere Attribute sind `next_packet_cost`, `required_credits`,
+`waiting_for_budget`, `retry_in_seconds`, `next_attempt_at`,
+`last_budget_query_at`, `last_budget_error` und `waiting_packets`. Ein alter Wert
+bleibt nach Verbindungsverlust als Historie sichtbar, erlaubt aber keinen Versand.
+Zeitangaben sind Schätzungen bis zur nächsten Prüfung, keine Sendegarantie.
+
+Protokollgrundlage: [CULFW32 0.2.12 X-Abfrage](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/frontend_culfw/src/frontend_culfw.cpp#L1266-L1285),
+[MAX!-Kosten](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/rf_proto_moritz/src/moritz_rf.cpp#L298-L307),
+[FHEM credit10ms](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/00_CUL.pm)
+und [FHEM MAX!-Warteschlange](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm).
+Firmware mit inkompatibler Budgetantwort bleibt sicherheitshalber für den Versand
+gesperrt.

@@ -230,3 +230,10 @@ Repository layout:
 ## License
 
 See [`LICENSE`](LICENSE).
+
+## Radio budget
+
+The integration queries the controller's actual transmission credits. See the
+[English guide](custom_components/cul_max/README.en.md#radio-budget) or the
+[German guide](custom_components/cul_max/README.md#funkbudget) for priority rules,
+failure handling and credit diagnostics.
