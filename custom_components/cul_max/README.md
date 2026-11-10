@@ -1187,27 +1187,37 @@ Der Coordinator berechnet Temperatur, Betriebsmodus und Preset gemeinsam aus dem
 zuletzt gemeldeten Gerätezustand und dem aktuellen Benutzerwunsch. Gerätemeldungen
 aktualisieren den gespeicherten tatsächlichen Zustand jederzeit, auch während
 Debouncing und Budgetwartezeit. Beim Löschen eines ungesendeten Befehls fällt die
-Anzeige sofort auf diese **inzwischen neuesten** gemeldeten Werte zurück. Dafür
+Anzeige sofort auf die **inzwischen neuesten** gemeldeten oder per ACK bestätigten
+Werte zurück. Dafür
 wird kein Rücksetzkommando gesendet. Ersetzte Vorgänger können einen neueren
 Wunsch nicht überschreiben.
 
 Ein ACK bestätigt die Annahme eines Kommandos, keine vollständige Statusmeldung.
-Nach ACK bleibt der Wunsch höchstens **30 Sekunden** sichtbar (`acknowledged`).
-Eine passende, nach der TCP-Übergabe empfangene Meldung beendet die Phase sofort
-(`synchronized`). Widersprüchliche Meldungen werden gespeichert und nach Ablauf
-angezeigt, auch wenn kein weiteres Paket eingeht. Weil MAX! keine sichere zeitliche
-Einordnung unaufgeforderter Meldungen erlaubt, kann eine echte lokale Änderung
-innerhalb dieser kurzen Phase vorübergehend verdeckt werden. Anschließend haben
-lokale Bedienung und Wochenprogramm wieder sofort Vorrang. Gerätemeldungen
-veranlassen niemals eine erneute Übertragung des alten Benutzerwunsches.
+Akzeptierte Temperatur und Betriebsart bleiben deshalb getrennt im Arbeitsspeicher
+(`state_source: acknowledged`); die tatsächlich gemeldeten Werte werden dadurch
+nicht verändert. **Es gibt keinen Abgleichtimer.** Ein alter gespeicherter Bericht
+darf eine bestätigte Einstellung nicht allein durch Zeitablauf ersetzen. Auch bei
+leerer Queue und ohne weitere Funkmeldung bleibt die bestätigte Einstellung sichtbar.
 
-ACK-Timeout oder Verbindungsfehler nach möglichem Versand bedeutet `unconfirmed`,
-mit derselben begrenzten Abgleichphase. Eindeutiges Scheitern vor dem Versand
-bedeutet `failed` und setzt die Anzeige sofort zurück. Firmwarefehler `ZERR1/2`
-liegen vor der Paketübergabe; `ZERR3` kann nach einem Versand auftreten. Ein später
-abgewiesener Retry macht einen früheren unbestätigten Versuch nicht ungeschehen.
-Ohne passenden Bericht bleibt nach der Frist `acknowledged` beziehungsweise
-`unconfirmed` erkennbar; ein Erfolg des Zustandsabgleichs wird nicht erfunden.
+Nach ACK haben neue Gerätemeldungen für die tatsächlich enthaltenen Felder sofort
+Vorrang. Das gilt auch für lokale Bedienung und Wochenprogrammwechsel. Ein
+unvollständiges Wand-Kontrollpaket kann die Temperatur ändern, ohne den zuletzt
+bestätigten Modus zu überschreiben. Wird ein neuerer, noch ungesendeter Wunsch
+gelöscht, bleibt eine vorher bestätigte Einstellung erhalten. Ein passender
+Gerätebericht ergibt `synchronized`; ein ACK allein bleibt `acknowledged`.
+
+Ohne positives ACK gilt möglicher Versand als `unconfirmed`. Der optimistische
+Anzeigewert bleibt ausdrücklich unbestätigt, bis ein tatsächlicher Bericht eintrifft;
+eine neue Temperatur-/Modusmeldung hat sofort Vorrang. Eindeutiges Scheitern vor
+Versand oder ein negatives ACK bedeutet `failed` und stellt die zuletzt gemeldeten
+oder bestätigten Werte wieder her. Firmwarefehler `ZERR1/2` liegen vor der
+Paketübergabe; `ZERR3` bleibt ungewiss. Ein abgewiesener Retry macht einen früheren
+unbestätigten Versuch nicht ungeschehen. Ein negatives ACK gilt niemals als Erfolg.
+
+MAX! liefert keinen verlässlichen Gerätezeitstempel für unaufgeforderte Berichte.
+Die Empfangsreihenfolge ist daher bewusst maßgeblich: Ein wirklich verspätetes,
+widersprüchliches Paket kann weiterhin einen neueren Wert ersetzen. Gerätemeldungen
+lösen keine erneute Übertragung eines alten Wunsches aus.
 
 | MAX!-Betriebsart | HA-Modus | Preset | Deutsche Anzeige |
 | --- | --- | --- | --- |
@@ -1238,13 +1248,13 @@ Zusätzliche Climate-Attribute:
 - `reported_target_temperature`, `reported_mode`: neueste tatsächliche Gerätemeldung.
 - `command_status`: Queue-Status, `acknowledged`, `synchronized`, `unconfirmed` oder Abbruch-/Fehlerstatus.
 - `temperature_command_status`: kompatibler Alias für `command_status`.
-- `state_source`: `requested` oder `reported`.
+- `state_source`: `requested`, `acknowledged` oder `reported`.
 
 Unvollständige Wandthermostatmeldungen überschreiben keine fehlenden Felder wie
 Modus, Batterie, Ventilstellung oder Endzeit. Ein gemeldeter Moduswechsel kann
 veraltete Sonderwerte ausdrücklich löschen. Beim Neustart werden ausschließlich
-Gerätemeldungen wiederhergestellt; Benutzerwünsche und Abgleichtimer werden nicht
-gespeichert. Entladen beendet die Timer. Alte, künstlich erzeugte Wand-Ventilwerte
+Gerätemeldungen wiederhergestellt; Benutzerwünsche und aus ACKs abgeleitete Werte
+werden nicht als Geräteberichte gespeichert. Entladen beendet die Debounce-Tasks. Alte, künstlich erzeugte Wand-Ventilwerte
 und Wand-Modi ohne nachweisbare Statusherkunft werden verworfen; der nächste volle
 Wandbericht liefert den Modus wieder. Entitäts-IDs bleiben erhalten. Aktuelle
 HA-Versionen verwenden die native Temperatur-API; ältere unterstützte Versionen

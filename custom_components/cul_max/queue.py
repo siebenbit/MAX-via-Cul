@@ -55,6 +55,7 @@ class QueueEntry:
     has_been_sent: bool = False
     # TCP handoff is uncertain until an ACK or an explicit firmware rejection.
     may_have_transmitted: bool = False
+    delivery_rejected: bool = False
     budget_delayed: bool = False
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ready_task: asyncio.Future | None = None

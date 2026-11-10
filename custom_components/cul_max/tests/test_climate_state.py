@@ -98,11 +98,9 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         entity = await self.entity()
         old = self.request(22, mode=1)
         await self.settle()
-        generation = self.c.get_temperature_intent("123456").generation
         new = self.request(18, mode=0)
         await self.settle()
         self.assertEqual((await old).status, "superseded")
-        self.c._expire_temperature_reconciliation("123456", generation)
         self.assert_display(entity, 18, "auto")
         self.assertEqual(self.display()["command_status"], "debouncing")
         self.c.clear_queue()
@@ -140,17 +138,13 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.c.clear_queue()
         await asyncio.gather(manual, changed, automatic, later)
 
-    async def test_ack_is_not_a_state_report_and_old_report_is_temporarily_hidden(self):
+    async def test_ack_is_not_a_state_report_and_new_report_has_immediate_priority(self):
         entity = await self.entity()
         await self.complete()
         self.assertEqual(self.display()["command_status"], "acknowledged")
         self.assertEqual(self.display()["reported_target_temperature"], 20)
         self.assert_display(entity, 22, "heat")
         await self.report(18, mode=0)
-        self.assert_display(entity, 22, "heat")
-        await self.advance(29.9)
-        self.assert_display(entity, 22, "heat")
-        await self.advance(.11)
         self.assert_display(entity, 18, "auto")
         self.assertEqual(self.display()["command_status"], "acknowledged")
         self.assertEqual(self.display()["state_source"], "reported")
@@ -162,7 +156,6 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await self.report(22, mode=1, valve=30)
         self.assertEqual(self.display()["command_status"], "synchronized")
         self.assertFalse(intent.overlay)
-        self.assertIsNone(intent.reconcile_handle)
         await self.report(18, mode=0)
         self.assert_display(entity, 18, "auto")
         await self.report(24, mode=1)
@@ -173,7 +166,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await self.report(22, mode=1)
         await self.complete()
         self.assertEqual(self.display()["command_status"], "acknowledged")
-        self.assertEqual(self.display()["state_source"], "requested")
+        self.assertEqual(self.display()["state_source"], "acknowledged")
 
     async def test_matching_report_between_send_and_ack_is_retained(self):
         self.cul.frame_hook = None
@@ -186,7 +179,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, .5)
         self.assertEqual(self.display()["command_status"], "synchronized")
 
-    async def test_ack_timeout_is_unconfirmed_then_uses_reported_state_after_deadline(self):
+    async def test_ack_timeout_is_unconfirmed_until_a_real_report_arrives(self):
         entity = await self.entity()
         self.cul.frame_hook = None
         with patch.object(mod, "SET_TEMPERATURE_ACK_RETRIES", 0), patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
@@ -198,7 +191,10 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.display()["command_status"], "unconfirmed")
         self.assert_display(entity, 22, "heat")
         await self.advance(30.01)
-        self.assert_display(entity, 20, "heat")
+        self.assert_display(entity, 22, "heat")
+        self.assertEqual(self.display()["command_status"], "unconfirmed")
+        await self.report(18, mode=0)
+        self.assert_display(entity, 18, "auto")
         self.assertEqual(self.display()["command_status"], "unconfirmed")
         await self.report(22, mode=1)
         self.assertEqual(self.display()["command_status"], "synchronized")
@@ -214,7 +210,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(outcome[0], ConnectionError)
         self.assert_display(entity, 18, "auto")
         self.assertEqual(self.display()["command_status"], "failed")
-        self.assertIsNone(self.c.get_temperature_intent("123456").reconcile_handle)
+        self.assertFalse(self.c.get_temperature_intent("123456").overlay)
 
     async def test_failure_before_handoff_restores_reported_state(self):
         entity = await self.entity()
@@ -269,7 +265,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assert_display(entity, 22, "heat")
         self.assertEqual(self.display()["command_status"], "unconfirmed")
         await self.advance(30.01)
-        self.assert_display(entity, 20, "heat")
+        self.assert_display(entity, 22, "heat")
 
     async def test_late_ack_for_older_command_does_not_confirm_newer_command(self):
         entity = await self.entity()
@@ -421,23 +417,123 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assert_display(entity, 18, "auto")
         self.assertFalse(self.cul.frames)
 
-    async def test_reconciliation_timer_fires_without_any_incoming_packet(self):
+    async def test_acknowledged_state_does_not_revert_without_new_report(self):
         entity = await self.entity()
-        with patch.object(mod, "TEMPERATURE_RECONCILIATION_SECONDS", .02):
-            await self.complete()
+        await self.complete()
         self.assert_display(entity, 22, "heat")
-        await asyncio.sleep(.04)
-        self.assert_display(entity, 20, "heat")
+        self.assertFalse(self.c.get_queue()["entries"])
+        await self.advance(31)
+        self.assert_display(entity, 22, "heat")
+        await self.advance(3600)
+        self.assert_display(entity, 22, "heat")
         self.assertEqual(self.display()["command_status"], "acknowledged")
 
-    async def test_new_intent_cancels_old_grace_timer_and_ignores_old_callback(self):
+    async def test_pure_manual_mode_change_stays_manual_without_new_report(self):
         entity = await self.entity()
-        old = await self.complete()
-        handle = old.reconcile_handle
+        await self.report(20, mode=0)
+        await self.complete(20, mode=1)
+        await self.advance(3600)
+        self.assert_display(entity, 20, "heat")
+        self.assertEqual(self.display()["reported_mode"], "auto")
+        self.assertEqual(self.display()["state_source"], "acknowledged")
+        await self.report(20, mode=0)
+        self.assert_display(entity, 20, "auto")
+
+    async def test_deleting_newer_wish_keeps_previously_acknowledged_temperature_and_mode(self):
+        entity = await self.entity()
+        await self.report(18, mode=0)
+        await self.complete(22, mode=1)
+        task = self.request(24, mode=0)
+        await self.settle()
+        self.assert_display(entity, 24, "auto")
+        self.c.clear_queue()
+        self.assertEqual((await task).status, "cancelled")
+        self.assert_display(entity, 22, "heat")
+        self.assertEqual(self.display()["reported_target_temperature"], 18)
+        self.assertEqual(self.display()["command_status"], "cancelled")
+
+    async def test_partial_report_overrides_only_reported_acknowledged_fields(self):
+        entity = await self.entity()
+        device = self.c.get_device("123456")
+        device.device_type = mod.DEVICE_WALL_THERMOSTAT
+        await self.report(kind=0x70, payload=bytes([0, 0, 36]))
+        await self.complete(22, mode=1)
+        await self.report(kind=0x42, payload=bytes([46, 190]))
+        self.assert_display(entity, 23, "heat")
+        self.assertEqual(self.display()["reported_mode"], "auto")
+        await self.report(kind=0x70, payload=bytes([0, 0, 46]))
+        self.assert_display(entity, 23, "auto")
+        self.assertEqual(self.display()["state_source"], "reported")
+        self.assertEqual(len(self.cul.frames), 1)
+
+    async def test_predecessor_ack_is_kept_if_newer_pending_wish_is_deleted(self):
+        entity = await self.entity()
+        self.cul.frame_hook = None
+        older = self.request(22)
+        await self.settle()
+        await self.advance(2.01)
+        newer = self.request(24, mode=0)
+        await self.settle()
+        self.cul.feed(transport.ack_line(self.cul.frames[0]))
+        await asyncio.wait_for(older, .5)
+        self.assert_display(entity, 24, "auto")
+        self.c.clear_queue()
+        self.assertEqual((await newer).status, "cancelled")
+        self.assert_display(entity, 22, "heat")
+
+    async def test_report_before_ack_does_not_overrule_later_command_acceptance(self):
+        entity = await self.entity()
+        self.cul.frame_hook = None
+        task = self.request(22)
+        await self.settle()
+        await self.advance(2.01)
+        await self.report(18, mode=0)
+        self.cul.feed(transport.ack_line(self.cul.frames[0]))
+        await asyncio.wait_for(task, .5)
+        self.assert_display(entity, 22, "heat")
+        await self.advance(3600)
+        self.assert_display(entity, 22, "heat")
+        await self.report(19, mode=0)
+        self.assert_display(entity, 19, "auto")
+
+    async def test_negative_ack_does_not_confirm_or_replace_accepted_state(self):
+        entity = await self.entity()
+        await self.complete(22)
+        self.cul.frame_hook = lambda cul, cmd: cul.feed(transport.ack_line(cmd)[:-2] + "81")
+        task = self.request(24, mode=0)
+        await self.settle()
+        await self.advance(2.01)
+        result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), .5)
+        self.assertIsInstance(result[0], ConnectionError)
+        self.assertEqual(self.display()["command_status"], "failed")
+        self.assert_display(entity, 22, "heat")
+        self.assertEqual(len(self.cul.frames), 2)
+
+    async def test_empty_ack_does_not_create_accepted_state(self):
+        self.cul.frame_hook = lambda cul, cmd: cul.feed("Z0A" + transport.ack_line(cmd)[3:-2])
+        with patch.object(mod, "SET_TEMPERATURE_ACK_RETRIES", 0), patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
+            task = self.request(22)
+            await self.settle()
+            await self.advance(2.01)
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), .5)
+        self.assertIsInstance(result[0], ConnectionError)
+        self.assertEqual(self.display()["command_status"], "unconfirmed")
+        self.assertFalse(self.c.get_device("123456").acknowledged_state)
+
+    async def test_auto_without_explicit_target_does_not_retain_old_acknowledged_target(self):
+        entity = await self.entity()
+        await self.complete(22)
+        await self.complete(0, mode=0)
+        self.assertEqual(self.display()["mode"], 0)
+        self.assertNotIn("desired_temperature", self.c.get_device("123456").acknowledged_state)
+        await self.report(18, mode=0)
+        self.assert_display(entity, 18, "auto")
+
+    async def test_new_intent_takes_priority_over_old_acknowledged_state(self):
+        entity = await self.entity()
+        await self.complete()
         newer = self.request(23, mode=0)
         await self.settle()
-        self.assertTrue(handle.cancelled())
-        self.c._expire_temperature_reconciliation("123456", old.generation)
         await self.report(22, mode=1)
         self.assert_display(entity, 23, "auto")
         self.assertEqual(self.display()["command_status"], "debouncing")
@@ -445,14 +541,11 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await newer
         self.assert_display(entity, 22, "heat")
 
-    async def test_shutdown_cancels_ack_reconciliation_handle(self):
+    async def test_acknowledged_state_has_no_pending_background_tasks_on_shutdown(self):
         intent = await self.complete()
-        handle = intent.reconcile_handle
-        self.assertIsNotNone(handle)
         await self.c.async_shutdown()
-        self.assertTrue(handle.cancelled())
         self.assertFalse(intent.overlay)
-        self.assertIsNone(intent.reconcile_handle)
+        self.assertFalse(self.c._temperature_tasks)
 
     async def test_restart_restores_reported_state_only_not_optimistic_or_ack_state(self):
         await self.complete()
@@ -460,6 +553,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await mod.CulMaxCoordinator._save_devices(self.c)
         saved = self.c._store.async_save.call_args.args[0]
         self.assertEqual(saved["devices"]["123456"]["last_state"]["desired_temperature"], 20)
+        self.assertNotIn("acknowledged_state", saved["devices"]["123456"])
         fresh = mod.CulMaxCoordinator(types.SimpleNamespace(loop=self.clock), "simulated")
         fresh._store = types.SimpleNamespace(async_load=AsyncMock(return_value=saved))
         fresh._save_devices = AsyncMock()

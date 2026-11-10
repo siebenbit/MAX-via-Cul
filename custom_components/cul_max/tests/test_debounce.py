@@ -109,9 +109,6 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         for deadline, event in list(self.waiters):
             if self.clock.time() >= deadline:
                 event.set()
-        for intent in self.c._desired_temperatures.values():
-            if intent.reconcile_deadline is not None and self.clock.time() >= intent.reconcile_deadline:
-                self.c._expire_temperature_reconciliation(intent.address, intent.generation)
         self.c._radio_changed.set()
         self.c._command_queue._ready.set()
         await self.settle()
@@ -240,7 +237,7 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity._attr_target_temperature, 23)
         self.c.delete_queue_entry(self.c.get_temperature_intent("123456").entry.id)
         self.assertEqual((await newer).status, "cancelled")
-        self.assertEqual(entity._attr_target_temperature, 20)
+        self.assertEqual(entity._attr_target_temperature, 21)
 
     async def test_mode_and_until_are_kept_with_the_latest_intent(self):
         from datetime import datetime
@@ -312,7 +309,7 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.get_temperature_intent("123456").entry.status, "failed")
         self.assertEqual(entity._attr_target_temperature, 20)
 
-    async def test_conflicting_post_ack_report_is_bounded_by_grace_period(self):
+    async def test_new_post_ack_report_immediately_becomes_authoritative(self):
         entity = await self.entity()
         task = self.request(23)
         await self.settle()
@@ -321,8 +318,6 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity._attr_target_temperature, 23)
         report = types.SimpleNamespace(mode=0, desired_temperature=21, measured_temperature=19, valve_position=0)
         await self.c._update_device_state("123456", report.__dict__)
-        self.assertEqual(entity._attr_target_temperature, 23)
-        await self.advance(30.01)
         self.assertEqual(entity._attr_target_temperature, 21)
         self.assertEqual(entity._attr_hvac_mode, "auto")
         self.assertFalse(self.c.get_temperature_intent("123456").overlay)

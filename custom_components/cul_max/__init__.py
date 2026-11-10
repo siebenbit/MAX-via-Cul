@@ -576,8 +576,7 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
         if temperature is None:
             raise ValueError("set_desired_temperature braucht eine Temperatur oder einen expliziten Modus.")
 
-        intent = coordinator.get_temperature_intent(address)
-        current_mode = intent.mode if intent and intent.overlay else coordinator.get_raw_mode(address)
+        current_mode = coordinator.get_display_state(address)["mode"]
         if keep_auto and current_mode in (MODE_AUTO, MODE_VACATION):
             result = await coordinator.async_set_temperature(address, float(temperature), mode=MODE_AUTO)
             effective_mode = "auto"

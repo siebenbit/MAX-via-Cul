@@ -260,9 +260,10 @@ for costs and the limits of these estimates.
 
 The standard thermostat card immediately displays pending changes, while the
 integration keeps actual device reports separate. Cancelling an unsent change
-restores the latest reported temperature, mode and preset together. Acknowledged
-or uncertain transmissions use a bounded 30-second reconciliation period;
-subsequent local changes and schedule transitions are never permanently hidden.
+restores the latest reported or acknowledged temperature, mode and preset together.
+Acknowledged settings stay visible until a new report updates them; there is no
+timer that restores an older report. Local changes and schedule transitions take
+immediate precedence after transmission completes.
 The German manual-mode label is **Manuell**. Valve position is reported separately
 without inferring heating activity. See the
 [English state guide](custom_components/cul_max/README.en.md#consistent-thermostat-state)

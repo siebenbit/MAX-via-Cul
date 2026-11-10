@@ -835,28 +835,35 @@ The coordinator calculates the entire climate display from the last reported
 device state and the latest `TemperatureIntent`. Temperature, operating mode and
 preset change together. Device reports always update the stored actual state,
 including while a Home Assistant command is debouncing or waiting for credits.
-Cancelling an unsent command restores these latest reported values immediately,
+Cancelling an unsent command restores the latest reported or acknowledged values,
 without transmitting a rollback command. Superseded generations cannot change a
 newer request. Two-second debouncing, queue cancellation and RF admission remain
 in force.
 
-An ACK confirms command acceptance, not a full state report. The climate entity
-shows `acknowledged` and keeps the requested settings for **at most 30 seconds**
-after the ACK. A matching report received after the command's TCP handoff ends
-this period immediately (`synchronized`). Reports with different values are
-stored immediately and become visible when the period expires, even if no more
-packets arrive. MAX! does not reliably timestamp unsolicited reports: a real
-local change within this short period can therefore be temporarily hidden.
-After reconciliation, local controls and weekly schedule changes take immediate
-precedence. Reports never trigger enforcement or retransmission of an old wish.
+An ACK confirms command acceptance, not a full state report. Accepted temperature
+and mode are kept separately in memory (`state_source: acknowledged`); the actual
+reported values remain unchanged. **There is no reconciliation timer.** An older
+stored report cannot replace an accepted setting just because time passes. Even
+if the queue is empty and no new report arrives, the accepted setting stays visible.
 
-An ACK timeout or uncertain TCP failure after a possible transmission is
-`unconfirmed`, with the same bounded reconciliation. A definite failure before
-transmission is `failed` and restores reported values immediately. Firmware
-`ZERR1/2` are pre-frame errors; `ZERR3` can occur after transmission and remains
-uncertain. An earlier uncertain attempt is not erased by a rejected retry.
-After the 30 seconds, ACK success remains `acknowledged`, or lack of confirmation
-remains `unconfirmed`, unless an actual matching report establishes synchronization.
+After acceptance, new device reports update the fields they actually contain
+immediately. This also applies to local changes and weekly schedule transitions.
+Partial wall control packets can change the temperature while preserving an
+acknowledged mode that they do not report. Cancelling a newer unsent request also
+preserves the preceding accepted setting. A matching report changes the command
+status to `synchronized`; an ACK alone remains `acknowledged`.
+
+Without a positive ACK, a possibly transmitted request is `unconfirmed`. Its
+optimistic display remains explicitly unconfirmed until an actual report arrives;
+a new temperature/mode report takes immediate precedence. A definite pre-send
+failure or explicit negative ACK is `failed` and restores the latest reported or
+accepted state. Firmware `ZERR1/2` are pre-frame errors; `ZERR3` remains uncertain.
+A rejected retry does not erase an earlier uncertain attempt. Negative ACKs are
+never accepted as successful commands.
+
+There is no reliable device timestamp for unsolicited MAX! state. Processing
+reports in receive order is deliberate: an actually delayed contradictory packet
+may still replace a newer value. Reports never enforce or retransmit an old wish.
 
 | MAX! setting | HA state | Preset | German label |
 | --- | --- | --- | --- |
@@ -887,13 +894,13 @@ Additional climate attributes:
 - `reported_target_temperature`, `reported_mode`: latest actual device report.
 - `command_status`: queue progress, `acknowledged`, `synchronized`, `unconfirmed`, or terminal cancellation/failure.
 - `temperature_command_status`: compatibility alias of `command_status`.
-- `state_source`: `requested` or `reported`.
+- `state_source`: `requested`, `acknowledged` or `reported`.
 
 Partial wall control reports update only the temperatures they contain. Missing
 mode, battery, valve, measured temperature or end-time fields do not erase known
 values; a reported mode change can explicitly clear obsolete special-mode data.
-On reload or restart, only actual reports are restored. Intents and reconciliation
-timers are never persisted, and unload cancels their timers. Legacy fabricated
+On reload or restart, only actual reports are restored. Intents and ACK-derived
+settings are never persisted as device reports; unload cancels debounce tasks. Legacy fabricated
 wall valve values and wall modes lacking report provenance are discarded; the
 next full wall status supplies the mode again. Entity IDs remain unchanged.
 Current HA uses the native temperature API; earlier supported versions retain a
