@@ -110,8 +110,8 @@ PENDING_QUEUE_MAINTENANCE_INTERVAL = 60.0
 PENDING_QUEUE_RETRY_BASE_DELAY = 30.0
 PENDING_QUEUE_RETRY_MAX_DELAY = 300.0
 AUTO_MODE_TIME_SYNC_FOLLOWUP_DELAY = 12.0
-TIME_INFORMATION_BURST_COUNT = 3
-TIME_INFORMATION_BURST_DELAY = 0.75
+AUTOMATIC_TIME_SYNC_COOLDOWN = 60.0
+TIME_SYNC_STALE_AFTER = timedelta(hours=6)
 
 
 def _sanitize_serial_number(raw: str) -> str:
@@ -185,6 +185,7 @@ class PendingAck:
     future: asyncio.Future[MaxMessage]
     description: str
     deadline: float | None = None
+    expected_dst: str | None = None
 
 
 @dataclass
@@ -216,6 +217,16 @@ class TemperatureIntent:
     configuration_deadline: float | None = None
     task: asyncio.Task | None = None
     overlay: bool = True
+
+
+class _RadioAcknowledged(Exception):
+    """Internal control flow: an earlier write was acknowledged before retry."""
+
+
+@dataclass
+class TimeSyncRequest:
+    entry: QueueEntry
+    task: asyncio.Task | None = None
 
 
 @dataclass
@@ -447,6 +458,11 @@ class CulMaxCoordinator:
         self._budget_listeners: list[Callable[[], None]] = []
         self._credit_wait_until = 0.0
         self._credit_lovf = False
+        self._time_sync_requests: dict[str, TimeSyncRequest] = {}
+        self._time_sync_tasks: set[asyncio.Task] = set()
+        self._last_time_sync_monotonic: dict[str, float] = {}
+        self._traffic_started_at = datetime.now(UTC).isoformat()
+        self._traffic: dict[str, dict[str, int]] = {}
 
         self._devices: dict[str, KnownDevice] = {}
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
@@ -986,6 +1002,11 @@ class CulMaxCoordinator:
     async def async_shutdown(self) -> None:
         """Close the TCP connection cleanly."""
         self._shutting_down = True
+        for task in list(self._time_sync_tasks):
+            task.cancel()
+        await asyncio.gather(*self._time_sync_tasks, return_exceptions=True)
+        self._time_sync_tasks.clear()
+        self._time_sync_requests.clear()
         for intent in list(self._debounce_intents.values()):
             self._stop_debounce(intent, "cancelled")
         for task in list(self._temperature_tasks):
@@ -1282,6 +1303,7 @@ class CulMaxCoordinator:
                     future=future,
                     description=request.description,
                     deadline=sent_at + request.timeout,
+                    expected_dst=self._extract_culfw_packet_hex(request.cmd)[8:14].upper(),
                 )
                 return request.cmd
 
@@ -1507,6 +1529,9 @@ class CulMaxCoordinator:
         if pending is None or pending.future.done():
             return
         if pending.deadline is not None and self.hass.loop.time() > pending.deadline:
+            return
+        expected_dst = pending.expected_dst or f"{self.own_address:06X}"
+        if msg.dst_hex != expected_dst:
             return
         if pending.counter != msg.counter:
             return
@@ -3564,7 +3589,7 @@ class CulMaxCoordinator:
             )
             for address in targets:
                 try:
-                    await self.async_send_time_information(address)
+                    await self.async_send_time_information(address, automatic=True)
                 except Exception:
                     _LOGGER.exception(
                         "Startup time sync to %s failed",
@@ -3629,7 +3654,7 @@ class CulMaxCoordinator:
         )
         for address in targets:
             try:
-                await self.async_send_time_information(address)
+                await self.async_send_time_information(address, automatic=True)
             except Exception:
                 _LOGGER.exception("Periodic time sync to %s failed", self._format_device_identity(address))
             await asyncio.sleep(0.5)
@@ -3645,21 +3670,14 @@ class CulMaxCoordinator:
         if self._pending_climate_config.get(normalized):
             return
 
-        should_sync = not device.last_time_sync_at
-        if not should_sync and device.last_time_sync_at:
-            try:
-                last_sync = datetime.fromisoformat(device.last_time_sync_at)
-            except ValueError:
-                should_sync = True
-            else:
-                should_sync = (datetime.now(UTC) - last_sync) >= timedelta(hours=6)
-
-        if not should_sync:
+        if not self._time_sync_needed(device):
             return
 
         try:
             await asyncio.sleep(0.5)
-            await self.async_send_time_information(normalized)
+            result = await self.async_send_time_information(normalized, automatic=True)
+            if result.status != "completed":
+                return
             _LOGGER.info(
                 "Sent follow-up time sync to %s after %s",
                 self._format_device_identity(normalized),
@@ -3672,43 +3690,84 @@ class CulMaxCoordinator:
                 reason,
             )
 
-    async def async_send_time_information(self, address: str, *, protocol_response: bool = False) -> CommandResult:
-        """Send current local time to one thermostat/wall thermostat."""
+    @staticmethod
+    def _time_sync_needed(device: KnownDevice) -> bool:
+        """Use the existing six-hour config criterion for automatic follow-ups."""
+        if device.last_time_offset_seconds is not None and abs(device.last_time_offset_seconds) > 5:
+            return True
+        if not device.last_time_sync_at:
+            return True
+        try:
+            last = datetime.fromisoformat(device.last_time_sync_at)
+            return datetime.now(UTC) - last >= TIME_SYNC_STALE_AFTER
+        except (ValueError, TypeError):
+            return True
+
+    async def async_send_time_information(
+        self, address: str, *, protocol_response: bool = False, automatic: bool = False,
+    ) -> CommandResult:
+        """Share pending requests; transmit one fresh time packet per actual sync."""
+        if self._shutting_down:
+            return CommandResult("cancelled")
         normalized = address.upper()
         device = self.get_device(normalized)
-        if device is None:
-            raise ValueError(f"Unbekannte Geraeteadresse {normalized}")
-        if device.device_type not in CLIMATE_DEVICE_TYPES:
+        if device is None or device.device_type not in CLIMATE_DEVICE_TYPES:
             raise ValueError(f"Geraet {normalized} unterstuetzt keine Zeitsynchronisation.")
         self._require_paired_for_write(normalized)
+        existing = self._time_sync_requests.get(normalized)
+        if existing and existing.task and not existing.task.done() and (
+            not existing.entry.has_been_sent or automatic and not protocol_response
+        ) and existing.entry.status not in {"cancelled", "failed", "superseded"}:
+            if protocol_response and not existing.entry.has_been_sent:
+                existing.entry.protected = True
+                self._command_queue.notify()
+            return await asyncio.shield(existing.task)
+        last = self._last_time_sync_monotonic.get(normalized)
+        clock_wrong = device.last_time_offset_seconds is not None and abs(device.last_time_offset_seconds) > 5
+        if automatic and not protocol_response and not clock_wrong and last is not None and (
+            self.hass.loop.time() - last < AUTOMATIC_TIME_SYNC_COOLDOWN
+        ):
+            _LOGGER.debug("Automatic TimeInformation for %s already sent recently", normalized)
+            return CommandResult("skipped")
+        future = self.hass.loop.create_future()
+        future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        entry = QueueEntry(normalized, self.format_device_label(normalized), "TimeInformation",
+                           f"TimeInformation {self.format_device_label(normalized)}", future,
+                           protected=protocol_response)
+        request = TimeSyncRequest(entry)
+        self._time_sync_requests[normalized] = request
+        request.task = self.hass.loop.create_task(self._send_single_time_information(normalized, request))
+        self._time_sync_tasks.add(request.task)
+        request.task.add_done_callback(self._time_sync_finished)
+        return await asyncio.shield(request.task)
 
-        _LOGGER.info(
-            "Sending TimeInformation burst (%d packets) to %s",
-            TIME_INFORMATION_BURST_COUNT,
-            self._format_device_identity(normalized),
-        )
-        await self._set_last_command(normalized, "TimeInformation")
-        for burst_index in range(TIME_INFORMATION_BURST_COUNT):
-            counter = self._next_counter()
-            cmd = build_time_information(counter, self.own_address, int(normalized, 16))
+    def _time_sync_finished(self, task: asyncio.Task) -> None:
+        self._time_sync_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # A disconnected waiter must not leak task exceptions.
+
+    async def _send_single_time_information(self, address: str, request: TimeSyncRequest) -> CommandResult:
+        try:
+            await self._set_last_command(address, "TimeInformation")
+            cmd = build_time_information(self._next_counter(), self.own_address, int(address, 16))
             result = await self._send_command(
-                cmd,
-                expected_src=None,
-                device_address=normalized,
-                counter=None,
-                protected=protocol_response,
-                description=(
-                    f"TimeInformation {self.format_device_label(normalized)}"
-                    if burst_index == 0
-                    else f"TimeInformation {self.format_device_label(normalized)} #{burst_index + 1}"
-                ),
+                cmd, expected_src=None, device_address=address, counter=None,
+                description=request.entry.description, entry=request.entry,
             )
-            if result.status != "completed":
-                return result
-            if burst_index + 1 < TIME_INFORMATION_BURST_COUNT:
-                await asyncio.sleep(TIME_INFORMATION_BURST_DELAY)
-        await self._mark_time_sync_sent(normalized)
-        return CommandResult("completed")
+            if result.status == "completed":
+                self._last_time_sync_monotonic[address] = self.hass.loop.time()
+                await self._mark_time_sync_sent(address)
+            return result
+        except asyncio.CancelledError:
+            if request.entry.status not in {"completed", "failed", "cancelled", "superseded"}:
+                self._command_queue.finish(request.entry, "cancelled")
+            return CommandResult("cancelled")
+        except Exception as err:
+            self._command_queue.finish(request.entry, "failed", error=err)
+            raise
+        finally:
+            if self._time_sync_requests.get(address) is request:
+                self._time_sync_requests.pop(address, None)
 
     async def async_sync_time(self, addresses: list[str] | None = None) -> list[str]:
         """Synchronize time to selected or all paired thermostats."""
@@ -3740,11 +3799,7 @@ class CulMaxCoordinator:
         )
 
     async def _auto_mode_time_sync_followup(self, address: str) -> None:
-        """Repeat TimeInformation shortly after entering auto mode.
-
-        TimeInformation has no ACK. Sending it once immediately and once a bit
-        later makes schedule re-entry more reliable after manual overrides.
-        """
+        """Refresh an unknown, stale or visibly incorrect clock after entering auto."""
         try:
             await asyncio.sleep(AUTO_MODE_TIME_SYNC_FOLLOWUP_DELAY)
             device = self.get_device(address)
@@ -3753,9 +3808,10 @@ class CulMaxCoordinator:
                 or device.device_type not in CLIMATE_DEVICE_TYPES
                 or not device.paired
                 or device.pending_config
+                or not self._time_sync_needed(device)
             ):
                 return
-            await self.async_send_time_information(address)
+            await self.async_send_time_information(address, automatic=True)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3764,7 +3820,8 @@ class CulMaxCoordinator:
                 self._format_device_identity(address),
             )
         finally:
-            self._auto_mode_time_sync_tasks.pop(address, None)
+            if self._auto_mode_time_sync_tasks.get(address) is asyncio.current_task():
+                self._auto_mode_time_sync_tasks.pop(address, None)
 
     async def async_wake_device(self, address: str) -> None:
         """Send WakeUp (0xF1) — keeps device RF receiver open briefly."""
@@ -3979,6 +4036,8 @@ class CulMaxCoordinator:
         cost = self._estimate_cul_credit_cost(pending.cmd) if pending else None
         wait = max(0.0, self._credit_wait_until - self.hass.loop.time())
         return {
+            "traffic_started_at": self._traffic_started_at,
+            "traffic_by_command": {name: dict(values) for name, values in self._traffic.items()},
             "reported_credits": self._credit_reported,
             "budget_valid": self._credit_valid,
             "next_packet_cost": cost,
@@ -3993,6 +4052,7 @@ class CulMaxCoordinator:
 
     async def _write_cul(
         self, cmd: str, before_send: Callable[[], str | None] | None = None,
+        radio_request: RadioRequest | None = None,
     ) -> None:
         """Write without reading; only the receive loop owns the reader."""
         async with self._send_lock:
@@ -4005,6 +4065,8 @@ class CulMaxCoordinator:
                         cmd = prepared
                 _LOGGER.debug("CUL TX: %s", cmd.strip())
                 self._writer.write((cmd.rstrip() + "\n").encode("ascii"))
+                if radio_request is not None:
+                    self._record_radio_write(cmd, radio_request)
                 await self._writer.drain()
             except (OSError, ConnectionError):
                 await self._close_connection()
@@ -4076,6 +4138,8 @@ class CulMaxCoordinator:
             self._command_queue.add(entry, worker=False)
 
         def guard_write():
+            if self._radio_acknowledged(request):
+                raise _RadioAcknowledged
             self._command_queue.before_write(entry)
             _LOGGER.debug("Queue: Sending %s %s", entry.command_type, entry.description)
             return before_send() if before_send else None
@@ -4116,6 +4180,12 @@ class CulMaxCoordinator:
             self._radio_changed.set()
             self._notify_budget_updated()
 
+    @staticmethod
+    def _radio_acknowledged(request: RadioRequest) -> bool:
+        ack = request.ack_future
+        return (request.written and ack is not None and ack.done()
+                and not ack.cancelled() and ack.exception() is None)
+
     async def _radio_worker(self) -> None:
         """One RF transaction at a time, independently of the ACK command queue.
 
@@ -4130,11 +4200,7 @@ class CulMaxCoordinator:
                 return
             # An ACK proves delivery even if the subsequent X barrier failed.
             # Keep the global budget paused, but do not retransmit that frame.
-            ack = request.ack_future
-            if (
-                request.written and ack is not None and ack.done()
-                and not ack.cancelled() and ack.exception() is None
-            ):
+            if self._radio_acknowledged(request):
                 request.future.set_result(None)
                 self._radio_requests.remove(request)
                 self._notify_budget_updated()
@@ -4153,6 +4219,8 @@ class CulMaxCoordinator:
                         request = self._next_radio_request()
                         if request is None:
                             continue
+                        if self._radio_acknowledged(request):
+                            raise _RadioAcknowledged
                         self._radio_changed.clear()
                         cost = self._estimate_cul_credit_cost(request.cmd)
                         if credits >= cost + CUL_CREDIT_RESERVE:
@@ -4160,12 +4228,15 @@ class CulMaxCoordinator:
                             self._credit_error = None
                             await self._write_cul(
                                 self._refresh_time_information_command(request.cmd),
-                                before_send=request.before_send,
+                                before_send=request.before_send, radio_request=request,
                             )
                             request.written = True
                             self._command_queue.set_status(request.entry, "awaiting_ack" if request.ack_future else "sending")
                             await self._query_credit()
                             if self._credit_lovf:
+                                stats = self._traffic_bucket(request.cmd)
+                                stats["firmware_rejections"] += 1
+                                stats["estimated_credits"] -= int(cost)
                                 request.written = False
                                 self._budget_failure("LOVF: firmware rejected transmission")
                             elif self._credit_error and not request.future.done():
@@ -4184,6 +4255,9 @@ class CulMaxCoordinator:
                             continue
                         self._credit_backoff = CUL_CREDIT_RETRY_MIN
                         self._credit_error = None
+                        if not request.entry.budget_delayed:
+                            request.entry.budget_delayed = True
+                            self._traffic_bucket(request.cmd)["budget_delayed"] += 1
                         delay = cost + CUL_CREDIT_RESERVE - credits + 1.0
                         self._command_queue.set_status(request.entry, "retrying" if request.entry.has_been_sent else "waiting_for_credits")
                         self._credit_wait_until = self.hass.loop.time() + delay
@@ -4195,6 +4269,12 @@ class CulMaxCoordinator:
                         )
                         self._notify_budget_updated()
                 await asyncio.wait_for(self._radio_changed.wait(), timeout=delay)
+            except _RadioAcknowledged:
+                if not request.future.done():
+                    request.future.set_result(None)
+                if request in self._radio_requests:
+                    self._radio_requests.remove(request)
+                self._notify_budget_updated()
             except QueueStopped:
                 if not request.future.done():
                     request.future.cancel()
@@ -4207,6 +4287,23 @@ class CulMaxCoordinator:
                 _LOGGER.exception("CUL radio request failed")
                 if not request.future.done():
                     request.future.set_exception(err)
+
+    def _traffic_bucket(self, cmd: str) -> dict[str, int]:
+        packet = self._extract_culfw_packet_hex(cmd)
+        kind = int(packet[6:8], 16) if packet else -1
+        name = {0x01: "PairPong", 0x02: "Ack", 0x03: "TimeInformation",
+                0x10: "ConfigWeekProfile", 0x11: "ConfigTemperatures",
+                0x20: "AddLinkPartner", 0x21: "RemoveLinkPartner", 0x22: "SetGroupId",
+                0x23: "RemoveGroupId", 0x30: "ShutterContactState", 0x40: "SetTemperature",
+                0xF1: "WakeUp"}.get(kind, "Other")
+        return self._traffic.setdefault(name, {"packets": 0, "estimated_credits": 0,
+            "retries": 0, "firmware_rejections": 0, "budget_delayed": 0})
+
+    def _record_radio_write(self, cmd: str, request: RadioRequest) -> None:
+        stats = self._traffic_bucket(cmd)
+        stats["packets"] += 1
+        stats["estimated_credits"] += int(self._estimate_cul_credit_cost(cmd))
+        stats["retries"] += int(request.entry.attempts > 1)
 
     def _extract_culfw_packet_hex(self, cmd: str) -> str | None:
         """Return the raw MAX!/CUL packet hex from one send command."""

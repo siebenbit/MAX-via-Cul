@@ -53,6 +53,7 @@ class QueueEntry:
     attempts: int = 0
     last_error: str | None = None
     has_been_sent: bool = False
+    budget_delayed: bool = False
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ready_task: asyncio.Future | None = None
     ready_deadline: float | None = None

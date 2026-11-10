@@ -249,3 +249,9 @@ for actions, installation, cancellation limits and simulation tests.
 
 Version 0.1.3 additionally collects temperature/mode changes for two seconds per
 thermostat while immediately displaying the desired target in Home Assistant.
+
+Version 0.1.4 reduces time synchronization from three packets to one, combines
+pending sync requests and avoids unnecessary auto-mode follow-ups and confirmed
+retransmissions. The existing credit sensor also exposes per-command traffic
+estimates. See the [radio traffic guide](custom_components/cul_max/README.en.md#reducing-radio-traffic-version-014)
+for costs and the limits of these estimates.

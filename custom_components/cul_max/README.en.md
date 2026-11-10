@@ -631,7 +631,7 @@ type: custom:cul-max-queue-card
 title: MAX! Queue
 ```
 
-For YAML resource management, register `/cul-max/cul-max-queue-card.js?v=0.1.3`
+For YAML resource management, register `/cul-max/cul-max-queue-card.js?v=0.1.4`
 as a `module` resource. Update the version query after subsequent releases.
 The visual editor supports title, controller, device address, status and scope.
 Optional fields: `config_entry_id`, `address`, `status`, `scope` (`general` or
@@ -745,4 +745,84 @@ successful transmission. Disconnecting a caller does not retract an accepted
 intent; replacement, explicit cancellation or integration shutdown does.
 
 For manually managed Lovelace resources, the current cache query is
-`/cul-max/cul-max-queue-card.js?v=0.1.3`.
+`/cul-max/cul-max-queue-card.js?v=0.1.4`.
+
+## Reducing radio traffic (version 0.1.4)
+
+The existing queue, two-second debounce, actual-credit queries, `Zs` preambles,
+ACK timeouts and retry limits remain intact. The principal savings are:
+
+| Change | Expected saving | Trade-off |
+| --- | --- | --- |
+| One TimeInformation packet instead of three | 224 credits per sync | No device ACK; equal delivery probability is not hardware-verified |
+| Share an already pending time sync for the same device | Avoid a complete duplicate sync | No protocol change |
+| Skip unnecessary auto-mode follow-up sync | Another 112 credits when skipped | Reuse the six-hour configuration-sync criterion |
+| Recheck ACK immediately before retry writing | Avoid 109–120 credits per unnecessary retry | Narrow race fix covered by simulation |
+| Automatic `Zf` use | Potentially 100 credits per packet | Deferred: reliable receive windows have not been established |
+
+Normal `Zs` costs without retries: SetTemperature/auto/boost 109 credits; vacation
+with end time 112; TimeInformation 112; ConfigTemperatures 114; group set/remove
+109/108; partner operations 112; WakeUp and PairPong 109. A weekly profile costs
+120 + 119 = 239 credits per day, or 1,673 credits for seven days (14 packets).
+Pairing still sends PairPong for each handled PairPing and a subsequent time sync
+for climate devices. Manual wakeups and required configuration sequences are kept.
+
+Ten startup time syncs therefore cost 1,120 instead of 3,360 credits. Auto re-entry
+with a recent clock costs 109 instead of 445; with a needed sync, 221 instead of
+445. A full weekly profile plus a required subsequent sync costs 1,785 instead of
+2,009 credits. These estimates assume no retries.
+
+### Time sync policy
+
+Pending unsent requests for one device share a single packet/result. A protocol
+request upgrades a shared unsent entry to protected. An explicit device request
+after writing has begun receives a new packet; an earlier write is not treated as
+its response. Automatic triggers can share an already running sync. Device
+addresses remain independent.
+
+Automatic syncs within 60 seconds of a successful sync in the current coordinator
+lifetime are skipped, avoiding startup/periodic overlaps. Persisted timestamps
+from an earlier HA run do not suppress startup synchronization. Explicit manual
+syncs, device requests and known clock errors exceeding five seconds bypass this
+short cooldown. Auto-mode follow-up and configuration completion require an
+unknown clock, a sync at least six hours old, or a reported offset beyond five
+seconds. Existing hourly slot checks, twelve-hour per-device slots and periodic
+minimum age remain unchanged. Packet timestamps are refreshed immediately before
+writing, even after long credit waits.
+
+### Preambles and retries
+
+No packet is automatically changed to `Zf`. A received frame or ACK does not
+establish a sufficiently long receive window through arbitrary queue delays. The
+inspected FHEM code contains window selection but then forces `needPreamble = 1`.
+Its extra wakeup before profile uploads is disabled because of observed packet
+loss. This integration likewise adds no new automatic wakeups or state-based
+suppression of required commands.
+
+ACK matching checks counter, device source and the actual destination matching
+the transmitted source address. An ACK arriving during a credit query or while
+waiting for the write lock now prevents another write. ACK deadlines still begin
+at the actual handoff; timeout and retry constants are unchanged.
+
+### Lightweight traffic statistics
+
+The existing **CUL Credits** sensor exposes `traffic_started_at` and
+`traffic_by_command`. Per type: `packets` counts RF commands handed to CUL;
+`estimated_credits` estimates their cost without admission reserve; `retries`
+counts further writes of the same queue entry; `firmware_rejections` counts
+`LOVF` attributed after a completed processing barrier; `budget_delayed` counts
+credit-delayed entries once each.
+
+Counters start at coordinator creation and are not persisted. `X`, `Zr`, discarded
+pending commands and debounce previews consume no RF credits. Attributed `LOVF`
+corrects the estimate; ambiguous connection failures retain a conservative
+estimate. Firmware-generated transmissions and other clients are not fully
+covered. These estimates neither prove device reception nor replace real `X`
+credit measurements or affect admission.
+
+Sources: [CULFW32 0.2.12 costs](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/rf_proto_moritz/src/moritz_rf.cpp#L298-L307),
+[FHEM time requests and send queue](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm),
+[FHEM profile/wakeup handling](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/10_MAX.pm).
+FHEM schedules one time request; its generic retries are separate. Single-packet
+radio delivery is not hardware-verified. Automated checks use simulated CUL
+responses; no firmware changes or new integration dependencies are needed.

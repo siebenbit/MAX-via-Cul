@@ -900,7 +900,7 @@ späteren Updates die Versionskennung anpassen:
 ```yaml
 lovelace:
   resources:
-    - url: /cul-max/cul-max-queue-card.js?v=0.1.3
+    - url: /cul-max/cul-max-queue-card.js?v=0.1.4
       type: module
 ```
 
@@ -1076,4 +1076,106 @@ bleibt ein bereits angenommener Wunsch dagegen bestehen, bis er ersetzt, manuell
 gelöscht oder durch die Integration abgeschlossen wird.
 
 Für manuell verwaltete Lovelace-Ressourcen lautet die aktuelle Cache-Kennung
-`/cul-max/cul-max-queue-card.js?v=0.1.3`.
+`/cul-max/cul-max-queue-card.js?v=0.1.4`.
+
+## Funkverkehr reduzieren (Version 0.1.4)
+
+Die Optimierung behält Queue, Zwei-Sekunden-Debouncing, reale Credit-Abfragen,
+Präambeln und ACK-/Retry-Grenzen bei. Die Einsparungen entstehen vor allem durch
+weniger Zeitpakete und das Vermeiden bestätigter Wiederholungen.
+
+| Änderung, nach erwartetem Nutzen | Einsparung | Bewertung |
+| --- | --- | --- |
+| Ein statt drei Zeitpakete | 224 Credits je Abgleich | Kleine Änderung; Zustellrate ohne Geräte-ACK nicht nachgewiesen gleich |
+| Ausstehende Zeitabgleiche je Gerät zusammenfassen | Ein kompletter zusätzlicher Abgleich je Duplikat | Keine Änderung am Funkprotokoll |
+| Auto-Folgeabgleich nur bei unbekannter, alter oder falscher Uhr | 112 weitere Credits, wenn der Abgleich entfällt | Gleiche Sechs-Stunden-Altersprüfung wie nach Konfiguration |
+| ACK direkt vor erneutem Schreiben prüfen | 109–120 Credits je verhinderter Wiederholung | Gezielte Korrektur eines simuliert reproduzierten Rennens |
+| Kurze Präambel automatisch verwenden | Theoretisch 100 Credits je Paket | Nicht umgesetzt: zuverlässiges Empfangsfenster nicht abgesichert |
+
+### Paketkosten und Auslöser
+
+Firmwarekosten mit langer Präambel, ohne Retries oder zusätzliche Zeitabgleiche:
+
+| Vorgang | Pakete | Credits |
+| --- | --- | --- |
+| Solltemperatur, Auto oder Boost | 1 | 109 |
+| Urlaub mit Endzeit | 1 | 112 |
+| Zeitabgleich | 1, bisher 3 | 112, bisher 336 |
+| Wochenprofil je Tag | 2 | 120 + 119 = 239 |
+| Wochenprofil für sieben Tage | 14 | 1.673 |
+| Temperaturkonfiguration | 1 | 114 |
+| Gruppe setzen / entfernen | 1 | 109 / 108 |
+| LinkPartner hinzufügen / entfernen | 1 | 112 |
+| WakeUp oder PairPong | 1 | 109 |
+
+Ein Zeitabgleich für zehn Thermostate benötigt damit 1.120 statt 3.360 Credits.
+Ein Auto-Wechsel mit frischer Uhr benötigt 109 statt 445 Credits; bei notwendigem
+Zeitabgleich 221 statt 445 Credits. Ein vollständiges Wochenprofil mit notwendigem
+anschließendem Zeitabgleich benötigt 1.785 statt 2.009 Credits. Die Einsparungen
+setzen eine Übertragung ohne Retries voraus. PairPong wird für jedes tatsächlich
+bearbeitete PairPing gesendet; bei Climate-Geräten folgt weiterhin ein Zeitabgleich.
+
+### Zeitabgleich
+
+TimeInformation wird einmal gesendet. Gleichzeitige Anforderungen teilen einen
+noch ungesendeten Auftrag desselben Geräts. Eine Geräteanfrage schützt einen
+geteilten Auftrag vor manuellem Löschen. Wenn bereits geschrieben wurde, erhält
+eine neue explizite Geräteanfrage einen neuen Auftrag; eine frühere Sendung gilt
+nicht nachträglich als deren Antwort. Automatische Auslöser dürfen einen bereits
+laufenden Auftrag teilen. Unterschiedliche Geräte bleiben unabhängig.
+
+Automatische Zeitabgleiche innerhalb von 60 Sekunden nach einem erfolgreich
+abgeschlossenen Abgleich derselben Integrationslaufzeit entfallen. Das vermeidet
+beispielsweise einen unmittelbar auf den periodischen Abgleich folgenden
+Startup-Abgleich. Ein gespeicherter Zeitstempel aus einem früheren HA-Lauf
+unterdrückt den Startup-Abgleich nicht. Manuelle Abgleiche, Geräteanfragen und
+bekannte Uhrabweichungen über fünf Sekunden umgehen die kurze Sperre.
+
+Der verzögerte Auto-Folgeabgleich und der Konfigurationsabschluss senden nur bei
+unbekannter Uhr, einem mindestens sechs Stunden alten Abgleich oder einer zuletzt
+gemeldeten Abweichung über fünf Sekunden. Stündliche Slot-Prüfung, Zwölf-Stunden-
+Geräteslots und bestehende periodische Mindestabstände bleiben erhalten. Der
+Zeitstempel im Paket wird weiter erst unmittelbar beim Versand aktualisiert.
+
+### Bewusst nicht geändert
+
+Alle bisherigen `Zs`-Pakete bleiben `Zs`. CULFW32 unterstützt zwar `Zf`, aber eine
+kurze Präambel setzt einen bereits empfangsbereiten Empfänger voraus. Eine gerade
+empfangene Nachricht, ein ACK oder die Reihenfolge von Konfigurationspaketen
+beweist kein ausreichend langes Empfangsfenster, besonders bei Credit-Wartezeiten.
+Die geprüfte FHEM-Referenz enthält eine Fensterentscheidung, überschreibt sie
+jedoch mit `needPreamble = 1`; ein zusätzlicher WakeUp vor Wochenprofilen ist dort
+wegen beobachteter Paketverluste deaktiviert. Die Integration fügt ebenfalls keine
+zusätzlichen automatischen WakeUps ein. Manuelle WakeUps und notwendige Gruppen-,
+Partner- und Konfigurationsschritte werden nicht anhand alter Gerätezustände entfernt.
+
+ACK-Fristen und Retry-Grenzen bleiben unverändert. Nachrichtenzähler, Absender
+und jetzt auch die Zieladresse des ACK müssen zum gesendeten Paket passen. Ein
+während Credit-Abfrage oder Schreiblock-Wartezeit eintreffendes gültiges ACK
+verhindert die erneute Übergabe. Die ACK-Frist startet weiterhin erst beim Schreiben.
+
+### Verbrauchsdiagnose
+
+Der vorhandene Sensor **CUL Credits** enthält zusätzlich `traffic_started_at` und
+`traffic_by_command`. Je Befehlstyp stehen zur Verfügung:
+
+- `packets`: an den CUL übergebene Funk-Sendeversuche, auch abgelehnte
+- `estimated_credits`: geschätzte Kosten dieser Versuche, ohne Freigabereserve
+- `retries`: weitere Schreibversuche desselben Queue-Auftrags
+- `firmware_rejections`: nach abgeschlossener Verarbeitungsbarriere zugeordnete `LOVF`-Ablehnungen
+- `budget_delayed`: wegen unzureichender Credits verzögerte Aufträge, einmal je Auftrag
+
+Die Werte beginnen bei Erstellung des Coordinators neu und werden nicht
+persistiert. `X`, `Zr` sowie verworfene oder ersetzte ungesendete Wünsche sind kein
+Funkverbrauch. Eindeutig zugeordnetes `LOVF` korrigiert die Kostenschätzung; bei
+Verbindungsabbruch mit unklarem Ergebnis bleibt sie konservativ. Firmwareinterne
+Sendungen und andere Clients sind nicht vollständig erfasst. Die Schätzung ist
+kein Geräteempfangsnachweis und ersetzt niemals die echte Budgetabfrage über `X`.
+
+Protokollgrundlage: [CULFW32 0.2.12 Kosten](https://github.com/tostmann/culfw32/blob/1ce78f17a6a06b1aecf4bf53479b0f7165a25c8d/firmware/components/rf_proto_moritz/src/moritz_rf.cpp#L298-L307),
+[FHEM TimeInformation und Sendepfad](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm),
+[FHEM Wochenprofil/WakeUp](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/10_MAX.pm).
+FHEM erzeugt je Zeitabgleich eine Anforderung; seine generische Retry-Behandlung
+ist davon getrennt. Eine unveränderte reale Zustellrate des einzelnen Zeitpakets
+wurde ohne Hardwaretests nicht nachgewiesen. Die Änderungen sind mit simulierten
+CUL-Antworten geprüft; sie erfordern keine Firmwareänderung oder neue Abhängigkeit.
