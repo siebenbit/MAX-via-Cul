@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -46,6 +48,8 @@ from .const import (
     STORAGE_VERSION,
     CLIMATE_DEVICE_TYPES,
     )
+from .queue import CommandQueueManager, CommandResult, QueueEntry, QueueStopped
+
 from .protocol import (
     MaxMessage,
     ThermostatState,
@@ -192,7 +196,8 @@ class CommandRequest:
     description: str
     retries: int
     timeout: float
-    future: asyncio.Future[MaxMessage | None]
+    future: asyncio.Future[CommandResult]
+    entry: QueueEntry | None = None
 
 
 @dataclass
@@ -202,9 +207,10 @@ class RadioRequest:
     priority: bool
     sequence: int
     future: asyncio.Future[None]
-    before_send: Callable[[], None] | None = None
+    before_send: Callable[[], str | None] | None = None
     ack_future: asyncio.Future[MaxMessage] | None = None
     written: bool = False
+    entry: QueueEntry | None = None
 
 
 @dataclass
@@ -220,6 +226,8 @@ class PendingShutterCommand:
     last_error: str = ""
     last_error_at: str = ""
     attempts: int = 0
+    job_id: str = field(default_factory=lambda: str(uuid4()))
+    step_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 @dataclass
@@ -237,11 +245,15 @@ class PendingClimateCommand:
     last_error: str = ""
     last_error_at: str = ""
     attempts: int = 0
+    job_id: str = field(default_factory=lambda: str(uuid4()))
+    step_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 def _serialize_pending_shutter_command(command: PendingShutterCommand) -> dict[str, Any]:
     """Serialize one pending shutter-contact command for storage."""
     return {
+        "job_id": command.job_id,
+        "step_id": command.step_id,
         "op": command.op,
         "description": command.description,
         "group_id": command.group_id,
@@ -258,6 +270,8 @@ def _serialize_pending_shutter_command(command: PendingShutterCommand) -> dict[s
 def _deserialize_pending_shutter_command(data: dict[str, Any]) -> PendingShutterCommand:
     """Deserialize one pending shutter-contact command from storage."""
     return PendingShutterCommand(
+        job_id=str(data.get("job_id") or uuid4()),
+        step_id=str(data.get("step_id") or uuid4()),
         op=str(data.get("op", "")),
         description=str(data.get("description", "")),
         group_id=data.get("group_id"),
@@ -278,6 +292,8 @@ def _deserialize_pending_shutter_command(data: dict[str, Any]) -> PendingShutter
 def _serialize_pending_climate_command(command: PendingClimateCommand) -> dict[str, Any]:
     """Serialize one pending climate command for storage."""
     return {
+        "job_id": command.job_id,
+        "step_id": command.step_id,
         "op": command.op,
         "description": command.description,
         "day": command.day,
@@ -296,6 +312,8 @@ def _serialize_pending_climate_command(command: PendingClimateCommand) -> dict[s
 def _deserialize_pending_climate_command(data: dict[str, Any]) -> PendingClimateCommand:
     """Deserialize one pending climate command from storage."""
     return PendingClimateCommand(
+        job_id=str(data.get("job_id") or uuid4()),
+        step_id=str(data.get("step_id") or uuid4()),
         op=str(data.get("op", "")),
         description=str(data.get("description", "")),
         day=int(data["day"]) if data.get("day") is not None else None,
@@ -372,7 +390,11 @@ class CulMaxCoordinator:
         self._startup_time_sync_task: asyncio.Task | None = None
         self._pending_queue_task: asyncio.Task | None = None
         self._auto_mode_time_sync_tasks: dict[str, asyncio.Task] = {}
-        self._command_queue: asyncio.Queue[CommandRequest] = asyncio.Queue()
+        self._queue_listeners: list[Callable[[], None]] = []
+        self._command_queue = CommandQueueManager(self._queue_changed)
+        self._config_jobs: dict[str, dict[str, Any]] = {}
+        self._storage_lock = asyncio.Lock()
+        self._temperature_generation: dict[str, int] = {}
         self._command_worker_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
         self._cul_credit_lock = asyncio.Lock()
@@ -485,6 +507,14 @@ class CulMaxCoordinator:
             schema_version = 2
             changed = True
 
+        if schema_version < 3:
+            for kind in ("pending_climate_config", "pending_shutter_config"):
+                for commands in migrated.get(kind, {}).values():
+                    job_id = str(uuid4())
+                    for command in commands:
+                        command.setdefault("job_id", job_id)
+                        command.setdefault("step_id", str(uuid4()))
+            changed = True
         if schema_version != STORAGE_SCHEMA_VERSION:
             migrated["schema_version"] = STORAGE_SCHEMA_VERSION
             changed = True
@@ -1009,6 +1039,8 @@ class CulMaxCoordinator:
                 await self._read_task
             except asyncio.CancelledError:
                 pass
+        for entry in list(self._command_queue.entries.values()):
+            self._command_queue.finish(entry, "cancelled")
         await self._close_connection()
         _LOGGER.info("CUL TCP connection to %s:%d closed", self.host, self.port)
 
@@ -1158,16 +1190,16 @@ class CulMaxCoordinator:
                 request = await self._command_queue.get()
                 try:
                     result = await self._execute_command_request(request)
-                    if not request.future.done():
-                        request.future.set_result(result)
+                    self._command_queue.finish(request.entry, "completed", ack=result)
+                except QueueStopped:
+                    pass
                 except asyncio.CancelledError:
                     if not request.future.done():
                         request.future.cancel()
                     raise
                 except Exception as err:
                     _LOGGER.debug("Command worker propagates exception for %s: %s", request.description, err)
-                    if not request.future.done():
-                        request.future.set_exception(err)
+                    self._command_queue.finish(request.entry, "failed", error=err)
                 finally:
                     self._command_queue.task_done()
         except asyncio.CancelledError:
@@ -1180,10 +1212,12 @@ class CulMaxCoordinator:
         """Send one queued command, optionally waiting for ACK with retries."""
         if request.counter is None:
             try:
-                await self._send_raw(request.cmd)
+                await self._send_raw(request.cmd, entry=request.entry)
                 if request.device_address:
                     await self._mark_command_success(request.device_address, retries=0, ack_at=None)
                 return None
+            except QueueStopped:
+                raise
             except Exception as err:
                 if request.device_address:
                     await self._mark_command_error(
@@ -1198,8 +1232,12 @@ class CulMaxCoordinator:
             future: asyncio.Future[MaxMessage] = self.hass.loop.create_future()
             sent_at = 0.0
 
-            def arm_ack() -> None:
+            def arm_ack() -> str:
                 nonlocal sent_at
+                if request.entry.replace_key and request.entry.attempts == 1:
+                    request.counter = self._next_counter()
+                    request.cmd = request.cmd[:4] + f"{request.counter:02X}" + request.cmd[6:]
+
                 sent_at = self.hass.loop.time()
                 self._pending_ack = PendingAck(
                     counter=request.counter,
@@ -1208,9 +1246,10 @@ class CulMaxCoordinator:
                     description=request.description,
                     deadline=sent_at + request.timeout,
                 )
+                return request.cmd
 
             try:
-                await self._send_raw(request.cmd, before_send=arm_ack, ack_future=future)
+                await self._send_raw(request.cmd, before_send=arm_ack, ack_future=future, entry=request.entry)
                 if future.done():
                     ack = future.result()
                 else:
@@ -1225,7 +1264,13 @@ class CulMaxCoordinator:
                     )
                 _LOGGER.info("ACK ok for %s on attempt %d", request.description, attempt)
                 return ack
+            except QueueStopped:
+                if not future.done():
+                    future.cancel()
+                self._pending_ack = None
+                raise
             except asyncio.TimeoutError as err:
+                self._command_queue.set_status(request.entry, "retrying")
                 last_error = err
                 if not future.done():
                     future.cancel()
@@ -1392,7 +1437,7 @@ class CulMaxCoordinator:
                 "TimeInformation request from %s without payload; sending current local time",
                 self._format_device_identity(msg.src_hex),
             )
-            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex, protocol_response=True))
             return
 
         if parsed is None:
@@ -1400,7 +1445,7 @@ class CulMaxCoordinator:
                 "TimeInformation from %s has invalid payload; sending corrected time",
                 self._format_device_identity(msg.src_hex),
             )
-            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex, protocol_response=True))
             return
 
         if abs(offset_seconds) > 5:
@@ -1409,7 +1454,7 @@ class CulMaxCoordinator:
                 self._format_device_identity(msg.src_hex),
                 offset_seconds,
             )
-            self._schedule_rx_response(self.async_send_time_information(msg.src_hex))
+            self._schedule_rx_response(self.async_send_time_information(msg.src_hex, protocol_response=True))
 
     def _dispatch(self, msg: MaxMessage, decoded: Any) -> None:
         """Call all registered listeners for this message."""
@@ -1582,10 +1627,25 @@ class CulMaxCoordinator:
         temperature: float,
         mode: int = 1,  # manual
         until: datetime | None = None,
-    ) -> None:
+    ) -> CommandResult:
         """Send SetTemperature (0x40) to a thermostat."""
         normalized = address.upper()
         self._require_paired_for_write(normalized)
+        # Validate before superseding a valid, older intent.
+        if not math.isfinite(temperature):
+            raise ValueError("Temperatur muss eine endliche Zahl sein")
+        device = self.get_device(normalized)
+        build_set_temperature(
+            0, self.own_address, int(normalized, 16), temperature,
+            MODE_VACATION if until is not None else mode,
+            until_hex=encode_max_until_datetime(until) if until is not None else "",
+            group_id=device.group_id if device else 0,
+        )
+        generation = self._temperature_generation.get(normalized, 0) + 1
+        self._temperature_generation[normalized] = generation
+        for old in list(self._command_queue.entries.values()):
+            if old.replace_key == f"SetTemperature:{normalized}" and old.cancellable:
+                self._command_queue.finish(old, "superseded")
         pending_task = self._pending_climate_tasks.get(normalized)
         if self._pending_climate_config.get(normalized) or (
             pending_task is not None and not pending_task.done()
@@ -1605,7 +1665,7 @@ class CulMaxCoordinator:
 
         dst = int(address, 16)
         label = self.format_device_label(address)
-        counter = self._next_counter()
+        counter = 0
         effective_mode = MODE_VACATION if until is not None else mode
         until_hex = encode_max_until_datetime(until) if until is not None else ""
         device = self.get_device(normalized)
@@ -1629,18 +1689,32 @@ class CulMaxCoordinator:
         command_label = f"SetTemperature {temperature:.1f} mode={MODE_NAMES.get(effective_mode, effective_mode)}"
         if until is not None:
             command_label += f" until={until.strftime('%Y-%m-%d %H:%M')}"
+        if generation != self._temperature_generation.get(normalized):
+            return CommandResult("superseded")
         await self._set_last_command(address, command_label)
-        await self._send_command(
+        if generation != self._temperature_generation.get(normalized):
+            return CommandResult("superseded")
+        mode_label = {MODE_AUTO: "Automatik", MODE_MANUAL: "Manuell", MODE_BOOST: "Boost", MODE_VACATION: "Urlaub"}.get(effective_mode, str(effective_mode))
+        queue_description = (f"SetTemperature Automatik · {label}" if effective_mode == MODE_AUTO and temperature <= 0
+                             else f"SetTemperature {temperature:g} °C · {mode_label} · {label}")
+        if until is not None:
+            queue_description += f" · bis {until.strftime('%d.%m.%Y %H:%M')}"
+        result = await self._send_command(
             cmd,
             expected_src=address,
             device_address=address,
             counter=counter,
-            description=f"SetTemperature {label}",
+            description=queue_description,
             retries=SET_TEMPERATURE_ACK_RETRIES,
             timeout=SET_TEMPERATURE_ACK_TIMEOUT,
+            replace_key=f"SetTemperature:{normalized}",
         )
-        if effective_mode == MODE_AUTO and temperature <= 0 and until is None:
+        if result.status != "completed":
+            return result
+        if (effective_mode == MODE_AUTO and temperature <= 0 and until is None
+                and generation == self._temperature_generation.get(normalized)):
             self._schedule_auto_mode_time_sync_followup(normalized)
+        return result
 
     async def _async_send_temperature_config(
         self,
@@ -1774,7 +1848,9 @@ class CulMaxCoordinator:
             )
 
     async def _sync_pending_config_reading(self, address: str) -> None:
-        """Mirror queued shutter-contact config into the persistent device record."""
+        """Mirror queued config and its job metadata into persistent storage."""
+        self._ensure_config_jobs()
+        self._command_queue.notify()
         device = self.get_device(address)
         if device is None:
             return
@@ -1809,6 +1885,10 @@ class CulMaxCoordinator:
         command.last_error = ""
         command.last_error_at = ""
         command.next_attempt_at = ""
+        job = self._config_jobs.get(command.job_id)
+        if job:
+            job["attempts"] = job.get("attempts", 0) + 1
+            job["last_error"] = None
 
     def _mark_pending_failure(
         self,
@@ -1820,6 +1900,10 @@ class CulMaxCoordinator:
         command.last_error_at = self._now_iso()
         retry_at = datetime.now(UTC) + timedelta(seconds=self._pending_retry_delay(command.attempts))
         command.next_attempt_at = retry_at.isoformat()
+        job = self._config_jobs.get(command.job_id)
+        if job:
+            job["last_error"] = str(err)
+            job["next_attempt_at"] = command.next_attempt_at
 
     def _pending_due(
         self,
@@ -1955,7 +2039,13 @@ class CulMaxCoordinator:
                 try:
                     self._mark_pending_attempt(command)
                     await self._send_shutter_pending_command(normalized, command, trigger=trigger)
+                except QueueStopped:
+                    break
                 except Exception as err:
+                    if self._config_jobs.get(command.job_id, {}).get("cancel_requested"):
+                        self._config_jobs[command.job_id]["status"] = "cancelled"
+                        await self._save_devices()
+                        break
                     self._mark_pending_failure(command, err)
                     await self._sync_pending_config_reading(normalized)
                     _LOGGER.warning(
@@ -1965,6 +2055,8 @@ class CulMaxCoordinator:
                         err.__class__.__name__,
                         err,
                     )
+                    break
+                if not self._pending_shutter_config.get(normalized):
                     break
                 self._pending_shutter_config[normalized].pop(0)
                 if not self._pending_shutter_config[normalized]:
@@ -2024,8 +2116,9 @@ class CulMaxCoordinator:
             trigger,
             command.description,
         )
+        confirmed = True
         try:
-            await self._send_command(
+            result = await self._send_command(
                 cmd,
                 expected_src=address,
                 device_address=address,
@@ -2033,7 +2126,10 @@ class CulMaxCoordinator:
                 description=f"{command.description} [pending]",
                 retries=0,
                 timeout=2.0,
+                job_id=command.job_id,
             )
+            if result.status != "completed":
+                raise QueueStopped(result.status)
         except ConnectionError as err:
             # Real shutter contacts often apply config inside their short wake/activity
             # window without giving us a clean ACK that matches our tracking.
@@ -2046,7 +2142,9 @@ class CulMaxCoordinator:
                 trigger,
                 command.description,
             )
+            confirmed = False
             await self._mark_command_success(address, retries=0, ack_at=None)
+        self._record_config_step(command, confirmed=confirmed)
         if command.op == "set_group_id" and command.group_id is not None:
             device.group_id = command.group_id
         elif command.op == "remove_group_id":
@@ -2076,6 +2174,14 @@ class CulMaxCoordinator:
         for command in commands:
             if not command.queued_at:
                 command.queued_at = now_iso
+        for old in self._pending_climate_config.get(normalized, []):
+            job = self._config_jobs.get(old.job_id)
+            if job:
+                job["cancel_requested"] = True
+                job["status"] = "cancelled"
+        job_id = str(uuid4())
+        for command in commands:
+            command.job_id = job_id
         self._pending_climate_config[normalized] = commands
         if commands:
             _LOGGER.info(
@@ -2129,7 +2235,13 @@ class CulMaxCoordinator:
                 try:
                     self._mark_pending_attempt(command)
                     await self._send_climate_pending_command(normalized, command, trigger=trigger)
+                except QueueStopped:
+                    break
                 except Exception as err:
+                    if self._config_jobs.get(command.job_id, {}).get("cancel_requested"):
+                        self._config_jobs[command.job_id]["status"] = "cancelled"
+                        await self._save_devices()
+                        break
                     self._mark_pending_failure(command, err)
                     await self._sync_pending_config_reading(normalized)
                     _LOGGER.warning(
@@ -2220,7 +2332,7 @@ class CulMaxCoordinator:
             command.description,
         )
         await self._set_last_command(address, command.description)
-        await self._send_command(
+        result = await self._send_command(
             cmd,
             expected_src=address,
             device_address=address,
@@ -2228,7 +2340,11 @@ class CulMaxCoordinator:
             description=f"{command.description} [pending]",
             retries=WEEK_PROFILE_ACK_RETRIES,
             timeout=WEEK_PROFILE_ACK_TIMEOUT,
+            job_id=command.job_id,
         )
+        if result.status != "completed":
+            raise QueueStopped(result.status)
+        self._record_config_step(command, confirmed=True)
         device = self.get_device(address)
         if device is not None and command.profile_hex:
             device.week_profile = command.profile_hex
@@ -2305,7 +2421,7 @@ class CulMaxCoordinator:
         self,
         address: str,
         is_open: bool,
-    ) -> None:
+    ) -> CommandResult:
         """Send a virtual ShutterContactState telegram using the stored group ID."""
         device = self.get_device(address)
         if device is None:
@@ -2337,6 +2453,8 @@ class CulMaxCoordinator:
         try:
             await self._send_raw(cmd, priority=True)
             await self._mark_command_success(address, retries=0, ack_at=None)
+        except QueueStopped as stopped:
+            return CommandResult(stopped.status)
         except Exception as err:
             await self._mark_command_error(address, str(err), retries=0)
             raise
@@ -2364,6 +2482,7 @@ class CulMaxCoordinator:
                 rf_error=False,
             ),
         )
+        return CommandResult("completed")
 
     async def async_set_group_id(self, address: str, group_id: int) -> None:
         """Assign a MAX! group ID to one device."""
@@ -3458,7 +3577,7 @@ class CulMaxCoordinator:
                 reason,
             )
 
-    async def async_send_time_information(self, address: str) -> None:
+    async def async_send_time_information(self, address: str, *, protocol_response: bool = False) -> CommandResult:
         """Send current local time to one thermostat/wall thermostat."""
         normalized = address.upper()
         device = self.get_device(normalized)
@@ -3477,20 +3596,24 @@ class CulMaxCoordinator:
         for burst_index in range(TIME_INFORMATION_BURST_COUNT):
             counter = self._next_counter()
             cmd = build_time_information(counter, self.own_address, int(normalized, 16))
-            await self._send_command(
+            result = await self._send_command(
                 cmd,
                 expected_src=None,
                 device_address=normalized,
                 counter=None,
+                protected=protocol_response,
                 description=(
                     f"TimeInformation {self.format_device_label(normalized)}"
                     if burst_index == 0
                     else f"TimeInformation {self.format_device_label(normalized)} #{burst_index + 1}"
                 ),
             )
+            if result.status != "completed":
+                return result
             if burst_index + 1 < TIME_INFORMATION_BURST_COUNT:
                 await asyncio.sleep(TIME_INFORMATION_BURST_DELAY)
         await self._mark_time_sync_sent(normalized)
+        return CommandResult("completed")
 
     async def async_sync_time(self, addresses: list[str] | None = None) -> list[str]:
         """Synchronize time to selected or all paired thermostats."""
@@ -3505,8 +3628,9 @@ class CulMaxCoordinator:
         )
         synced: list[str] = []
         for address in list(dict.fromkeys(targets)):
-            await self.async_send_time_information(address)
-            synced.append(address)
+            result = await self.async_send_time_information(address)
+            if result.status == "completed":
+                synced.append(address)
             await asyncio.sleep(0.25)
         return synced
 
@@ -3596,31 +3720,121 @@ class CulMaxCoordinator:
         return self._counter
 
     async def _send_command(
-        self,
-        cmd: str,
-        *,
-        expected_src: str | None,
-        device_address: str | None,
-        counter: int | None,
-        description: str,
-        retries: int = ACK_RETRIES,
-        timeout: float = ACK_TIMEOUT,
-    ) -> MaxMessage | None:
-        """Queue one MAX! command for serialized execution."""
-        future: asyncio.Future[MaxMessage | None] = self.hass.loop.create_future()
-        await self._command_queue.put(
-            CommandRequest(
-                cmd=cmd,
-                expected_src=expected_src,
-                device_address=device_address,
-                counter=counter,
-                description=description,
-                retries=retries,
-                timeout=timeout,
-                future=future,
-            )
+        self, cmd: str, *, expected_src: str | None,
+        device_address: str | None, counter: int | None, description: str,
+        retries: int = ACK_RETRIES, timeout: float = ACK_TIMEOUT,
+        replace_key: str | None = None, job_id: str | None = None,
+        protected: bool = False,
+    ) -> CommandResult:
+        if job_id and self._config_jobs.get(job_id, {}).get("cancel_requested"):
+            return CommandResult("cancelled")
+        future = self.hass.loop.create_future()
+        request = CommandRequest(cmd, expected_src, device_address, counter,
+                                 description, retries, timeout, future)
+        command_type = description.split()[0]
+        entry = QueueEntry(
+            device_address.upper() if device_address else None,
+            self.format_device_label(device_address) if device_address else "CUL",
+            command_type, description, future, payload=request, replace_key=replace_key,
+            scope="configuration" if job_id else "general", job_id=job_id,
+            protected=protected or bool(job_id) or command_type not in {"SetTemperature", "TimeInformation", "WakeUp"},
         )
-        return await future
+        request.entry = entry
+        self._command_queue.add(entry)
+        _LOGGER.debug("Queue: %s %s queued (%s)", command_type, device_address, entry.id)
+        try:
+            return await future
+        except asyncio.CancelledError:
+            if entry.cancellable:
+                self._command_queue.finish(entry, "cancelled")
+            raise
+
+    def _queue_changed(self) -> None:
+        for listener in self._queue_listeners:
+            listener()
+
+    def add_queue_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        self._queue_listeners.append(listener)
+        return lambda: self._queue_listeners.remove(listener)
+
+    def get_queue(self) -> dict[str, Any]:
+        snapshot = self._command_queue.snapshot()
+        self._ensure_config_jobs()
+        snapshot["jobs"] = json.loads(json.dumps(list(self._config_jobs.values())))
+        for job in snapshot["jobs"]:
+            job["command_type"] = "WeekProfile" if job["kind"] == "climate" else "Configuration"
+            active = next((entry for entry in self._command_queue.entries.values() if entry.job_id == job["id"]), None)
+            if active and not job.get("cancel_requested"):
+                job["status"] = active.status
+                job["attempts"] = active.attempts
+            job["cancellable"] = False
+        snapshot["budget"] = self.get_budget_diagnostics()
+        return snapshot
+
+    def _ensure_config_jobs(self) -> None:
+        for kind, queues in (("climate", self._pending_climate_config), ("shutter", self._pending_shutter_config)):
+            for address, commands in queues.items():
+                for command in commands:
+                    job = self._config_jobs.setdefault(command.job_id, {
+                        "id": command.job_id, "device_address": address,
+                        "device_name": self.format_device_label(address), "kind": kind,
+                        "description": "Wochenprofil" if kind == "climate" else "Gerätekonfiguration",
+                        "scope": "configuration", "created_at": command.queued_at or self._now_iso(),
+                        "status": "queued", "cancel_requested": False,
+                        "steps": [], "completed_steps": [], "confirmed_steps": [],
+                    })
+                    if not any(step["id"] == command.step_id for step in job["steps"]):
+                        job["steps"].append({"id": command.step_id, "description": command.description})
+        pending_jobs = {command.job_id for queues in (self._pending_climate_config, self._pending_shutter_config)
+                        for commands in queues.values() for command in commands}
+        live_jobs = {entry.job_id for entry in self._command_queue.entries.values()}
+        for key, job in self._config_jobs.items():
+            if key not in pending_jobs and key not in live_jobs and job["status"] not in {"completed", "cancelled", "failed"}:
+                job["status"] = "cancelled"
+                job["cancel_requested"] = True
+        terminal = [key for key, job in self._config_jobs.items() if job["status"] in {"completed", "cancelled", "failed"}]
+        for key in terminal[:-50]:
+            self._config_jobs.pop(key, None)
+
+    def _record_config_step(self, command, *, confirmed: bool) -> None:
+        job = self._config_jobs.get(command.job_id)
+        if job is None:
+            return
+        if command.step_id not in job["completed_steps"]:
+            job["completed_steps"].append(command.step_id)
+        if confirmed and command.step_id not in job["confirmed_steps"]:
+            job["confirmed_steps"].append(command.step_id)
+        job["status"] = ("cancelled" if job["cancel_requested"] else
+                         "completed" if len(job["completed_steps"]) == len(job["steps"]) else "queued")
+        self._command_queue.notify()
+
+    async def async_cancel_config_job(self, job_id: str, *, confirm: bool) -> dict:
+        if not confirm:
+            raise ValueError("Konfigurationsabbruch muss ausdrücklich bestätigt werden")
+        self._ensure_config_jobs()
+        job = self._config_jobs.get(job_id)
+        if job is None:
+            raise ValueError("Konfigurationsauftrag nicht vorhanden")
+        if job["status"] in {"completed", "cancelled"}:
+            return {"job_id": job_id, "status": job["status"]}
+        active = [entry for entry in self._command_queue.entries.values()
+                  if entry.job_id == job_id and entry.has_been_sent]
+        job["cancel_requested"] = True
+        job["status"] = "cancelling" if active else "cancelled"
+        for entry in list(self._command_queue.entries.values()):
+            if entry.job_id == job_id and not entry.has_been_sent:
+                self._command_queue.finish(entry, "cancelled")
+        # Remove all future steps. The active command owns its own request and
+        # finishes independently; a saved cancellation always blocks restoration.
+        for queues in (self._pending_climate_config, self._pending_shutter_config):
+            for address in list(queues):
+                queues[address] = [command for command in queues[address] if command.job_id != job_id]
+                if not queues[address]:
+                    del queues[address]
+        await self._sync_pending_config_reading(job["device_address"])
+        await self._save_devices()
+        self._command_queue.notify()
+        return {"job_id": job_id, "status": job["status"]}
 
     def _schedule_rx_response(self, coroutine: Coroutine[Any, Any, None]) -> None:
         """Keep receive-triggered replies out of the only TCP reader."""
@@ -3665,7 +3879,7 @@ class CulMaxCoordinator:
         }
 
     async def _write_cul(
-        self, cmd: str, before_send: Callable[[], None] | None = None,
+        self, cmd: str, before_send: Callable[[], str | None] | None = None,
     ) -> None:
         """Write without reading; only the receive loop owns the reader."""
         async with self._send_lock:
@@ -3673,7 +3887,9 @@ class CulMaxCoordinator:
                 raise ConnectionError("CUL disconnected")
             try:
                 if before_send:
-                    before_send()
+                    prepared = before_send()
+                    if prepared is not None:
+                        cmd = prepared
                 _LOGGER.debug("CUL TX: %s", cmd.strip())
                 self._writer.write((cmd.rstrip() + "\n").encode("ascii"))
                 await self._writer.drain()
@@ -3723,24 +3939,65 @@ class CulMaxCoordinator:
 
     async def _send_raw(
         self, cmd: str, *, priority: bool = False,
-        before_send: Callable[[], None] | None = None,
+        before_send: Callable[[], str | None] | None = None,
         ack_future: asyncio.Future[MaxMessage] | None = None,
+        entry: QueueEntry | None = None,
     ) -> None:
         """Queue RF admission; priority affects order, never credit limits."""
         if not self._estimate_cul_credit_cost(cmd):
             await self._write_cul(cmd)
             return
         future: asyncio.Future[None] = self.hass.loop.create_future()
-        request = RadioRequest(cmd, priority, self._radio_sequence, future, before_send, ack_future)
+        owns_entry = entry is None
+        if owns_entry:
+            packet = self._extract_culfw_packet_hex(cmd)
+            message = parse_message("Z" + packet) if packet else None
+            virtual = message is not None and message.msg_type == 0x30
+            address = message.src_hex if virtual else message.dst_hex if message else None
+            entry = QueueEntry(
+                address, self.format_device_label(address) if address else "CUL / Protokoll",
+                "VirtualShutterContactState" if virtual else "ProtocolResponse",
+                "Virtueller Fensterkontakt" if virtual else "Protokollantwort",
+                self.hass.loop.create_future(), priority=priority, protected=not virtual,
+            )
+            self._command_queue.add(entry, worker=False)
+
+        def guard_write():
+            self._command_queue.before_write(entry)
+            _LOGGER.debug("Queue: Sending %s %s", entry.command_type, entry.description)
+            return before_send() if before_send else None
+
+        request = RadioRequest(cmd, priority, self._radio_sequence, future, guard_write, ack_future, entry=entry)
         self._radio_sequence += 1
         self._radio_requests.append(request)
         self._radio_changed.set()
         if self._radio_task is None or self._radio_task.done():
             self._radio_task = self.hass.loop.create_task(self._radio_worker())
         self._notify_budget_updated()
+        stopped = self.hass.loop.create_task(entry.stop.wait())
         try:
+            done, _ = await asyncio.wait({future, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            if entry.stop.is_set():
+                future.cancel()
+                raise QueueStopped(entry.status)
             await future
+            if owns_entry:
+                self._command_queue.finish(entry, "completed")
+        except QueueStopped:
+            raise
+        except Exception as err:
+            if owns_entry:
+                # Direct protocol writes have no command-worker error consumer.
+                entry.last_error = str(err)
+                self._command_queue.finish(entry, "failed")
+            raise
         finally:
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
+            if not future.done():
+                future.cancel()
+            if owns_entry and entry.status not in {"completed", "failed", "cancelled", "superseded"}:
+                self._command_queue.finish(entry, "cancelled")
             if request in self._radio_requests:
                 self._radio_requests.remove(request)
             self._radio_changed.set()
@@ -3793,6 +4050,7 @@ class CulMaxCoordinator:
                                 before_send=request.before_send,
                             )
                             request.written = True
+                            self._command_queue.set_status(request.entry, "awaiting_ack" if request.ack_future else "sending")
                             await self._query_credit()
                             if self._credit_lovf:
                                 request.written = False
@@ -3814,6 +4072,7 @@ class CulMaxCoordinator:
                         self._credit_backoff = CUL_CREDIT_RETRY_MIN
                         self._credit_error = None
                         delay = cost + CUL_CREDIT_RESERVE - credits + 1.0
+                        self._command_queue.set_status(request.entry, "retrying" if request.entry.has_been_sent else "waiting_for_credits")
                         self._credit_wait_until = self.hass.loop.time() + delay
                         _LOGGER.info(
                             "CUL budget waits %.1fs for %s: need %.0f + reserve %d, "
@@ -3823,6 +4082,9 @@ class CulMaxCoordinator:
                         )
                         self._notify_budget_updated()
                 await asyncio.wait_for(self._radio_changed.wait(), timeout=delay)
+            except QueueStopped:
+                if not request.future.done():
+                    request.future.cancel()
             except TimeoutError:
                 if self._writer is None:
                     self._budget_failure("Credit query timed out")
@@ -4469,6 +4731,10 @@ class CulMaxCoordinator:
         changed = migrated
         self._pending_shutter_config = {}
         self._pending_climate_config = {}
+        self._config_jobs = data.get("configuration_jobs", {})
+        for job in self._config_jobs.values():
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
         for addr, d in data.get("devices", {}).items():
             device_type = d["device_type"]
             firmware_version = d.get("firmware_version", "")
@@ -4544,6 +4810,7 @@ class CulMaxCoordinator:
                 _deserialize_pending_shutter_command(command)
                 for command in commands or []
                 if isinstance(command, dict) and command.get("op") and command.get("description")
+                and not self._config_jobs.get(command.get("job_id"), {}).get("cancel_requested")
             ]
             if restored:
                 self._pending_shutter_config[normalized] = restored
@@ -4553,6 +4820,7 @@ class CulMaxCoordinator:
                 _deserialize_pending_climate_command(command)
                 for command in commands or []
                 if isinstance(command, dict) and command.get("op") and command.get("description")
+                and not self._config_jobs.get(command.get("job_id"), {}).get("cancel_requested")
             ]
             if restored:
                 self._pending_climate_config[normalized] = restored
@@ -4575,7 +4843,12 @@ class CulMaxCoordinator:
             await self._save_devices()
 
     async def _save_devices(self) -> None:
+        async with self._storage_lock:
+            await self._save_devices_locked()
+
+    async def _save_devices_locked(self) -> None:
         data = {
+            "configuration_jobs": self._config_jobs,
             "schema_version": STORAGE_SCHEMA_VERSION,
             "devices": {
                 addr: {
@@ -4631,4 +4904,4 @@ class CulMaxCoordinator:
                 if commands
             },
         }
-        await self._store.async_save(data)
+        await self._store.async_save(json.loads(json.dumps(data)))

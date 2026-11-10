@@ -881,3 +881,149 @@ Protokollgrundlage: [CULFW32 0.2.12 X-Abfrage](https://github.com/tostmann/culfw
 und [FHEM MAX!-Warteschlange](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm).
 Firmware mit inkompatibler Budgetantwort bleibt sicherheitshalber für den Versand
 gesperrt.
+
+## Sendewarteschlange verwalten
+
+Ab Version 0.1.2 zeigt `custom:cul-max-queue-card` die allgemeine Sendewarteschlange
+und die davon getrennten persistenten Konfigurationsaufträge. Die Karte wird im
+Lovelace-Storage-Modus über die vorhandene Ressourcenregistrierung automatisch
+hinzugefügt. Danach eine manuelle Karte mit folgender Konfiguration anlegen:
+
+```yaml
+type: custom:cul-max-queue-card
+title: MAX! Warteschlange
+```
+
+Bei YAML-Ressourcenverwaltung zusätzlich diese Modulressource eintragen; bei
+späteren Updates die Versionskennung anpassen:
+
+```yaml
+lovelace:
+  resources:
+    - url: /cul-max/cul-max-queue-card.js?v=0.1.2
+      type: module
+```
+
+Der visuelle Editor bietet Titel, Controller, Geräteadresse, Status und Bereich.
+Bei einem Controller erfolgt die Auswahl automatisch; bei mehreren muss ein
+Controller gewählt werden. Optionale Kartenfelder: `config_entry_id`, `address`,
+`status` und `scope` (`general` oder `configuration`). Die Karte lädt beim Öffnen,
+bei Änderungen des Queue-Diagnosesensors und nach Wiederverbindung neue Daten.
+Es gibt kein regelmäßiges Polling der Queue-Liste. Namen und Beschreibungen
+werden als Text ausgegeben; Rohpakete sind nicht Bestandteil der Übersicht.
+
+### Ersetzen und Löschen
+
+Mehrere noch ungesendete SetTemperature-Anforderungen desselben Geräts ersetzen
+sich: Nur der letzte vollständige Wunsch aus Temperatur, Auto-/Manuell-/Boost-
+oder Urlaubsmodus und gegebenenfalls Endzeit bleibt stehen. Der neue Auftrag
+steht am Ende der übrigen Befehle. Andere Geräte und Befehlstypen bleiben
+unabhängig. Auch ein bereits auf Credits wartender Auftrag ist ersetzbar.
+Wochenprofile, Gruppen-, Partner- und Pairing-Sequenzen werden nicht automatisch
+zusammengefasst.
+
+Die verbindliche Grenze ist der Aufruf von `writer.write()` unter dem
+TCP-Schreiblock. Unmittelbar davor werden Abbruch und Ersetzung nochmals geprüft.
+Ab Beginn der Übergabe bleibt der Auftrag bis zum Abschluss geschützt, auch
+während ACK-Retries oder eines Reconnects. Ein Löschwunsch kann bereits gesendete
+Pakete nicht zurücknehmen und bucht keine Credits zurück. Eine TCP-Trennung nach
+Übergabe kann ohne Geräte-ACK keine eindeutige Zustellung garantieren; die
+vorhandene Wiederholung kann das Paket erneut senden.
+
+Die Karte unterstützt Einzel- und Mehrfachlöschung sowie bestätigtes Leeren.
+Laufende Übertragungen und Protokollantworten sind geschützt. Interne Pakete
+mehrteiliger Konfigurationen sind nicht einzeln löschbar. „Wartende Befehle leeren“
+betrifft ausschließlich abbrechbare allgemeine Befehle des gewählten Controllers
+und optionalen Gerätefilters, unabhängig vom angezeigten Statusfilter.
+
+### Konfigurationsaufträge abbrechen
+
+„Auftrag abbrechen“ benötigt eine gesonderte Bestätigung. Ein bereits gesendetes
+Teilpaket beendet seinen ACK-/Retry-Ablauf; die übrigen Schritte werden entfernt.
+Währenddessen lautet der Auftragsstatus `cancelling`, danach `cancelled`.
+Abbruchabsicht und entfernte Schritte werden vor erfolgreicher Rückmeldung
+persistiert, sodass sie nach Neustart nicht wieder aufgenommen werden.
+Bereits bestätigte Teilpakete bleiben im Fortschritt dokumentiert. Bei bestehenden
+Fensterkontakt-Abläufen ohne ACK wird eine angenommene Übertragung getrennt von
+einer bestätigten Übertragung gezählt. Ein teilweise übertragenes Wochenprofil
+wird nicht zurückgerollt; bei Bedarf ein vollständiges Profil erneut übertragen.
+
+### Aktionen und Ergebnisse
+
+Die Entwicklerwerkzeuge bieten folgende Aktionen. `get_queue` liefert
+Response-Daten; die Änderungsaktionen können optional Response-Daten liefern.
+
+```yaml
+action: cul_max.get_queue
+data:
+  # Optional: config_entry_id, address, statuses, command_types, scope
+  scope: general
+response_variable: warteschlange
+```
+
+```yaml
+action: cul_max.delete_queue_entry
+data:
+  entry_id: "UUID-aus-get_queue"
+  # Alternativ: entry_ids: ["UUID-1", "UUID-2"]
+```
+
+```yaml
+action: cul_max.clear_queue
+data:
+  # Bei mehreren Controllern erforderlich:
+  # config_entry_id: "..."
+  # Optional:
+  address: "06473F"
+```
+
+```yaml
+action: cul_max.cancel_config_job
+data:
+  job_id: "Auftrags-UUID-aus-get_queue"
+  confirm: true
+```
+
+Snapshots enthalten Controller, allgemeine Einträge, Konfigurationsaufträge und
+eine begrenzte Historie. Einzelnes Löschen eines inzwischen gesendeten Eintrags
+liefert einen verständlichen Fehler. Sammellöschungen liefern `removed` und
+`protected`. Temperatur- und virtuelle Fensterkontakt-Aktionen melden ihren
+Abschlussstatus als `status`. `superseded` und `cancelled` sind erwartete Abbrüche,
+keine Gerätebestätigung und kein Kommunikationsfehler. Ein ersetzter Climate-Aufruf
+schreibt seinen alten Sollwert nicht nachträglich in die Oberfläche zurück.
+
+Statuswerte: `queued`, `waiting_for_credits`, `sending`, `awaiting_ack`, `retrying`,
+`completed`, `failed`, `cancelled`, `superseded`; Konfigurationsaufträge ergänzen
+`cancelling`. Geräte-ACKs bleiben nach Nachrichtenzähler und Absender zugeordnet.
+Zähler ersetzbarer Befehle werden erst beim ersten Versand vergeben und für
+Retries beibehalten. Das acht Bit breite MAX!-Zählerformat wird nicht verändert.
+
+Der Controller-Sensor **Sendewarteschlange** zeigt wartende Befehle. Attribute
+enthalten aktive Befehle, Konfigurationsaufträge, aktuellen Befehl, Ersetzungs- und
+Abbruchzähler, letzten Queue-Fehler und eine Änderungsrevision. Aktualisierungen
+werden über 100 ms gebündelt. Allgemeine Befehle und ihre maximal 50 historischen
+Einträge sind nicht neustartpersistent. Je Controller sind maximal 256 aktive oder
+wartende allgemeine/interne Funkaufträge zugelassen; neue Anforderungen bei voller
+Queue erhalten einen Fehler, vorhandene Aufträge werden nicht still verworfen.
+Persistente Auftragsmetadaten verwenden Speicherschema 3, mit Migration vorhandener
+Aufträge; maximal 50 abgeschlossene Auftragsdatensätze bleiben erhalten.
+
+### Tests ohne Funkhardware
+
+```sh
+python3 -m unittest discover -s custom_components/cul_max/tests
+node custom_components/cul_max/tests/frontend/queue-card.test.mjs
+node --check custom_components/cul_max/frontend/cul-max-queue-card.js
+git diff --check
+```
+
+Optionaler Browsercheck mit separat installiertem Playwright und Chromium:
+
+```sh
+python3 custom_components/cul_max/tests/frontend/check_queue_card.py
+```
+
+Dieser verwendet ausschließlich die lokale Testseite mit simulierten
+Home-Assistant-Antworten. Playwright ist keine Laufzeitabhängigkeit der Integration.
+Eine echte Home-Assistant-Laufzeit und Hardwarekommunikation müssen getrennt
+von diesen Simulationstests geprüft werden.

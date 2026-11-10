@@ -1104,3 +1104,67 @@ cleanup_superseded_devices:
       description: Entfernt auch als entdeckt markierte, nicht gekoppelte Altgeraete
       selector:
         boolean:
+
+get_queue:
+  name: Sendewarteschlange anzeigen
+  description: Liefert allgemeine Befehle und getrennte persistente Konfigurationsaufträge.
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: cul_max
+    address:
+      selector:
+        text:
+    statuses:
+      selector:
+        object:
+    command_types:
+      selector:
+        object:
+    scope:
+      selector:
+        select:
+          options:
+            - general
+            - configuration
+
+delete_queue_entry:
+  name: Wartende Befehle löschen
+  description: Löscht nur sicher ungesendete allgemeine Befehle; entry_id oder entry_ids angeben.
+  fields:
+    entry_id:
+      selector:
+        text:
+    entry_ids:
+      selector:
+        object:
+
+clear_queue:
+  name: Sendewarteschlange leeren
+  description: Entfernt abbrechbare allgemeine Befehle. Laufende Übertragungen und Konfigurationsaufträge bleiben erhalten.
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: cul_max
+    address:
+      selector:
+        text:
+
+cancel_config_job:
+  name: Konfigurationsauftrag abbrechen
+  description: Stoppt nach dem laufenden Teilpaket. Bereits übertragene Schritte werden nicht zurückgenommen. confirm muss true sein.
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: cul_max
+    job_id:
+      required: true
+      selector:
+        text:
+    confirm:
+      required: true
+      selector:
+        boolean:

@@ -31,6 +31,7 @@ from .const import (
 )
 from .coordinator import CulMaxCoordinator
 from .frontend import async_register_frontend
+from .queue_api import CONTROLLERS, SERVICES as QUEUE_SERVICES, register_queue_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -315,6 +316,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bo
         raise ConfigEntryNotReady(f"Cannot connect to CULFW at {host}:{port}")
 
     entry.runtime_data = coordinator
+    coordinator.config_entry_id = entry.entry_id
+    hass.data.setdefault(CONTROLLERS, {})[entry.entry_id] = coordinator
+    register_queue_services(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _register_services(hass, coordinator)
@@ -519,9 +523,10 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
         temperature = call.data.get("temperature")
 
         if mode_name == "boost":
-            await coordinator.async_set_temperature(address, 0.0, mode=MODE_BOOST)
+            result = await coordinator.async_set_temperature(address, 0.0, mode=MODE_BOOST)
             return {
                 "device": _device_payload(address),
+                "status": result.status,
                 "mode": "boost",
                 "temperature": 0.0,
             }
@@ -530,7 +535,7 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
             if temperature is None:
                 raise ValueError("set_desired_temperature mit until braucht eine Temperatur.")
             until = _parse_until_value(hass, until_text)
-            await coordinator.async_set_temperature(
+            result = await coordinator.async_set_temperature(
                 address,
                 float(temperature),
                 mode=MODE_MANUAL,
@@ -538,19 +543,21 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
             )
             return {
                 "device": _device_payload(address),
+                "status": result.status,
                 "mode": "until",
                 "temperature": float(temperature),
                 "until": until.isoformat(),
             }
 
         if mode_name == "auto":
-            await coordinator.async_set_temperature(
+            result = await coordinator.async_set_temperature(
                 address,
                 float(temperature) if temperature is not None else 0.0,
                 mode=MODE_AUTO,
             )
             return {
                 "device": _device_payload(address),
+                "status": result.status,
                 "mode": "auto",
                 "temperature": float(temperature) if temperature is not None else 0.0,
             }
@@ -558,9 +565,10 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
         if mode_name == "manual":
             if temperature is None:
                 raise ValueError("set_desired_temperature im manual-Modus braucht eine Temperatur.")
-            await coordinator.async_set_temperature(address, float(temperature), mode=MODE_MANUAL)
+            result = await coordinator.async_set_temperature(address, float(temperature), mode=MODE_MANUAL)
             return {
                 "device": _device_payload(address),
+                "status": result.status,
                 "mode": "manual",
                 "temperature": float(temperature),
             }
@@ -570,13 +578,14 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
 
         current_mode = coordinator.get_raw_mode(address)
         if keep_auto and current_mode in (MODE_AUTO, MODE_VACATION):
-            await coordinator.async_set_temperature(address, float(temperature), mode=MODE_AUTO)
+            result = await coordinator.async_set_temperature(address, float(temperature), mode=MODE_AUTO)
             effective_mode = "auto"
         else:
-            await coordinator.async_set_temperature(address, float(temperature), mode=MODE_MANUAL)
+            result = await coordinator.async_set_temperature(address, float(temperature), mode=MODE_MANUAL)
             effective_mode = "manual"
         return {
             "device": _device_payload(address),
+                "status": result.status,
             "mode": effective_mode,
             "temperature": float(temperature),
             "keep_auto": keep_auto,
@@ -726,11 +735,11 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
             _LOGGER.error("send_virtual_shutter_contact_state: missing address, entity_id or device_name")
             return
         is_open = _coerce_bool_value(call.data["is_open"])
-        await coordinator.async_send_virtual_shutter_contact_state(
+        result = await coordinator.async_send_virtual_shutter_contact_state(
             address,
             is_open,
         )
-        return {"device": _device_payload(address), "is_open": is_open}
+        return {"device": _device_payload(address), "is_open": is_open, "status": result.status}
 
     async def handle_create_room_association(call: ServiceCall) -> dict[str, object]:
         climate_addresses = _resolve_addresses_from_data(
@@ -1419,6 +1428,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> b
     """Unload the config entry and close serial connection."""
     coordinator: CulMaxCoordinator = entry.runtime_data
     await coordinator.async_shutdown()
+    hass.data.get(CONTROLLERS, {}).pop(entry.entry_id, None)
+    if not hass.data.get(CONTROLLERS):
+        for service_name in QUEUE_SERVICES:
+            hass.services.async_remove(DOMAIN, service_name)
     # Only remove services if no other entries are still loaded
     if not hass.config_entries.async_entries(DOMAIN):
         for service_name in SERVICE_NAMES:

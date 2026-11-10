@@ -26,7 +26,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up diagnostic sensor entities for all known devices."""
     coordinator: CulMaxCoordinator = entry.runtime_data
-    entities: list[SensorEntity] = [CulMaxCreditSensor(coordinator, entry.entry_id)]
+    entities: list[SensorEntity] = [CulMaxCreditSensor(coordinator, entry.entry_id), CulMaxQueueSensor(coordinator, entry.entry_id)]
     known_ids: set[str] = set()
 
     for device in coordinator.get_all_devices():
@@ -49,6 +49,56 @@ async def async_setup_entry(
 
     entry.async_on_unload(coordinator.add_global_listener(on_new_device))
     async_add_entities(entities)
+
+
+class CulMaxQueueSensor(SensorEntity):
+    """Compact revision signal for cards; full lists use the response API."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Sendewarteschlange"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:format-list-bulleted"
+
+    def __init__(self, coordinator: CulMaxCoordinator, entry_id: str) -> None:
+        self._coordinator = coordinator
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{DOMAIN}_{entry_id}_queue"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, f"controller_{coordinator.host}:{coordinator.port}")})
+        self._update_handle = None
+
+    @property
+    def native_value(self):
+        return self._coordinator._command_queue.snapshot()["waiting"]
+
+    @property
+    def extra_state_attributes(self):
+        data = self._coordinator.get_queue()
+        return {"cul_max_queue": True, "config_entry_id": self._entry_id,
+                "session_id": data["session_id"], "revision": data["revision"],
+                "active": data["active"], "superseded_count": data["superseded_count"],
+                "cancelled_count": data["cancelled_count"], "last_queue_error": data["last_error"],
+                "configuration_jobs": sum(job["status"] not in {"completed", "cancelled", "failed"} for job in data["jobs"]),
+                "current_command": next((item["description"] for item in data["entries"] if item["status"] in {"sending", "awaiting_ack", "retrying"}), None)}
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(self._coordinator.add_queue_listener(self._changed))
+        self.async_on_remove(self._cancel_update)
+
+    @callback
+    def _cancel_update(self):
+        if self._update_handle:
+            self._update_handle.cancel()
+            self._update_handle = None
+
+    @callback
+    def _changed(self):
+        if self._update_handle is None:
+            self._update_handle = self.hass.loop.call_later(.1, self._publish)
+
+    @callback
+    def _publish(self):
+        self._update_handle = None
+        self.async_write_ha_state()
 
 
 class CulMaxCreditSensor(SensorEntity):

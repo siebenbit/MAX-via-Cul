@@ -254,9 +254,11 @@ class CulMaxClimate(ClimateEntity):
         if temperature is None:
             return
         mode = self._temperature_write_mode()
-        await self._coordinator.async_set_temperature(
+        result = await self._coordinator.async_set_temperature(
             self._address, temperature, mode=mode
         )
+        if result.status != "completed":
+            return
         self._attr_target_temperature = temperature
         self._attr_hvac_mode = HVAC_MODE_MAP.get(mode, HVACMode.HEAT)
         self.async_write_ha_state()

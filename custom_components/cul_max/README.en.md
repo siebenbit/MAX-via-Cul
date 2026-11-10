@@ -620,3 +620,90 @@ Sources: [CULFW32 0.2.12 X query](https://github.com/tostmann/culfw32/blob/1ce78
 [FHEM credit10ms](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/00_CUL.pm)
 and [FHEM MAX! queue](https://github.com/mhop/fhem-mirror/blob/master/fhem/FHEM/14_CUL_MAX.pm).
 Firmware returning an incompatible credit format cannot authorize RF writes.
+
+## Inspecting and controlling the transmission queue
+
+Version 0.1.2 adds the bundled `custom:cul-max-queue-card`. Storage-mode Lovelace
+resources are registered automatically. Add a manual card:
+
+```yaml
+type: custom:cul-max-queue-card
+title: MAX! Queue
+```
+
+For YAML resource management, register `/cul-max/cul-max-queue-card.js?v=0.1.2`
+as a `module` resource. Update the version query after subsequent releases.
+The visual editor supports title, controller, device address, status and scope.
+Optional fields: `config_entry_id`, `address`, `status`, `scope` (`general` or
+`configuration`). One controller is selected automatically; multiple controllers
+require an explicit selection. Revision changes on the queue diagnostic sensor
+trigger refreshes, with a full reload after frontend reconnection. Lists are not
+polled periodically and raw RF packets are not exposed.
+
+Unsent SetTemperature commands for the same device use latest-value-wins,
+including automatic, manual, boost and vacation mode with its end time. Each
+replacement is a complete new intent and moves to the end of the remaining
+commands. Different devices and command types remain independent. A command
+waiting for credits can still be replaced or deleted. Pairing, groups, partners,
+protocol responses and configuration sequences are not automatically merged.
+
+Cancellation is checked under the TCP write lock immediately before
+`writer.write()`. Once handoff starts, the command remains protected through
+ACK handling, retries and reconnection. Credits are never refunded after a
+handoff. Following a TCP failure without a device ACK, delivery remains uncertain
+and existing retries may transmit the same frame again.
+
+The card supports individual and selected deletion, confirmed clearing, details
+and separately confirmed configuration cancellation. Clearing affects only
+cancellable general commands for the selected controller and device filter,
+regardless of the displayed status filter. Internal configuration packets cannot
+be deleted individually. A cancelled configuration job finishes its already
+transmitted step, including ACK/retries, then stops. Cancellation is saved before
+success is returned, preventing restart from resuming it. Confirmed steps stay
+recorded. Existing shutter-contact operations that assume delivery without an
+ACK are counted separately from confirmed steps. Partial device configuration is
+not rolled back; resend a complete weekly profile when required.
+
+Actions available in the developer tools:
+
+| Action | Parameters and result |
+| --- | --- |
+| `cul_max.get_queue` | Optional `config_entry_id`, `address`, `statuses`, `command_types`, `scope`; returns controller snapshots, entries, jobs and bounded history |
+| `cul_max.delete_queue_entry` | `entry_id`, or `entry_ids` for batch deletion; batches report `removed` and `protected` |
+| `cul_max.clear_queue` | Optional `address`; `config_entry_id` required when multiple controllers are loaded |
+| `cul_max.cancel_config_job` | `job_id`, `confirm: true`, and controller selection if needed; cancels the complete persistent job |
+
+The read action requires response data; mutation actions support optional response
+data. Deleting a single protected or no-longer-present entry raises a clear
+validation error. Temperature and virtual-window actions return `status`.
+`cancelled` and `superseded` finish callers without indicating device success or
+communication failure. Superseded climate calls do not write obsolete target
+values back into HA. Device ACK matching and retry behavior remain intact.
+Replaceable commands receive their final message counter only on first handoff;
+retries retain it. MAX!'s eight-bit counter format is unchanged.
+
+Statuses are `queued`, `waiting_for_credits`, `sending`, `awaiting_ack`, `retrying`,
+`completed`, `failed`, `cancelled` and `superseded`. Configuration jobs additionally
+use `cancelling`. The controller's queue sensor exposes waiting/active counts,
+configuration jobs, the current command, replacement/cancellation counters, the
+last queue error and a revision signal. Updates are coalesced over 100 ms.
+
+General commands and their last 50 terminal records are runtime-only. A controller
+admits at most 256 live general/internal RF requests; capacity errors reject new
+requests without silently discarding existing ones. Persistent jobs use additive
+storage schema 3 migration and retain at most 50 terminal job records.
+
+Validation without hardware:
+
+```sh
+python3 -m unittest discover -s custom_components/cul_max/tests
+node custom_components/cul_max/tests/frontend/queue-card.test.mjs
+node --check custom_components/cul_max/frontend/cul-max-queue-card.js
+git diff --check
+```
+
+Optional browser checks use separately installed Playwright/Chromium:
+`python3 custom_components/cul_max/tests/frontend/check_queue_card.py`. They run
+against a local simulated HA page, not a real HA instance or radio. Playwright is
+not an integration runtime dependency. Real HA and hardware validation remain
+separate from these simulation tests.

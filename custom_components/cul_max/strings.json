@@ -754,6 +754,78 @@
           "description": "Entfernt auch als entdeckt markierte, nicht gekoppelte Altgeraete"
         }
       }
+    },
+    "get_queue": {
+      "name": "Sendewarteschlange anzeigen",
+      "description": "Liefert eine strukturierte Übersicht der Befehle und Konfigurationsaufträge.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Controller",
+          "description": "Bei mehreren CUL-Controllern den gewünschten Eintrag auswählen."
+        },
+        "address": {
+          "name": "MAX!-Adresse",
+          "description": "Optional nach der sechsstelligen Zieladresse filtern."
+        },
+        "statuses": {
+          "name": "Statusfilter",
+          "description": "Optionale Liste der gewünschten Queue-Statuswerte."
+        },
+        "command_types": {
+          "name": "Befehlstypen",
+          "description": "Optionale Liste, zum Beispiel SetTemperature oder TimeInformation."
+        },
+        "scope": {
+          "name": "Bereich",
+          "description": "Allgemeine Sendebefehle oder persistente Konfigurationsaufträge."
+        }
+      }
+    },
+    "delete_queue_entry": {
+      "name": "Wartende Befehle löschen",
+      "description": "Löscht ausschließlich noch sicher abbrechbare allgemeine Befehle.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrags-ID",
+          "description": "UUID eines noch sicher abbrechbaren allgemeinen Befehls."
+        },
+        "entry_ids": {
+          "name": "Eintrags-IDs",
+          "description": "Alternativ mehrere UUIDs als Liste; geschützte Einträge bleiben erhalten."
+        }
+      }
+    },
+    "clear_queue": {
+      "name": "Sendewarteschlange leeren",
+      "description": "Löscht abbrechbare allgemeine Befehle. Laufende Übertragungen und Konfigurationsaufträge bleiben erhalten.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Controller",
+          "description": "Bei mehreren CUL-Controllern den gewünschten Eintrag auswählen."
+        },
+        "address": {
+          "name": "MAX!-Adresse",
+          "description": "Optional nach der sechsstelligen Zieladresse filtern."
+        }
+      }
+    },
+    "cancel_config_job": {
+      "name": "Konfigurationsauftrag abbrechen",
+      "description": "Stoppt einen vollständigen Auftrag nach dem bereits laufenden Teilpaket und speichert den Abbruch.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Controller",
+          "description": "Bei mehreren CUL-Controllern den gewünschten Eintrag auswählen."
+        },
+        "job_id": {
+          "name": "Auftrags-ID",
+          "description": "UUID des vollständigen persistenten Konfigurationsauftrags."
+        },
+        "confirm": {
+          "name": "Abbruch bestätigen",
+          "description": "Muss true sein. Bereits übertragene Schritte werden nicht zurückgenommen."
+        }
+      }
     }
   }
 }

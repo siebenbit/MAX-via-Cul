@@ -14,6 +14,8 @@ with _MANIFEST_PATH.open(encoding="utf-8") as manifest_file:
     INTEGRATION_VERSION = json.load(manifest_file).get("version", "0.0.0")
 
 FRONTEND_MODULES = [
+    {"name": "CUL MAX Queue Card", "filename": "cul-max-queue-card.js",
+     "version": INTEGRATION_VERSION, "legacy_paths": []},
     {
         "name": "CUL MAX Week Profile Card",
         "filename": "cul-max-week-profile-card.js",
@@ -105,7 +107,7 @@ DEFAULT_WEEK_PROFILE = (
 # Storage key for known devices
 STORAGE_KEY = f"{DOMAIN}_devices"
 STORAGE_VERSION = 1
-STORAGE_SCHEMA_VERSION = 2
+STORAGE_SCHEMA_VERSION = 3
 
 # Config entry keys
 CONF_HOST = "host"

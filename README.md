@@ -237,3 +237,12 @@ The integration queries the controller's actual transmission credits. See the
 [English guide](custom_components/cul_max/README.en.md#radio-budget) or the
 [German guide](custom_components/cul_max/README.md#funkbudget) for priority rules,
 failure handling and credit diagnostics.
+
+## Queue management card
+
+The bundled `custom:cul-max-queue-card` shows pending commands and persistent
+configuration jobs, supports safe cancellation, and updates when the queue
+changes. Unsent temperature/mode changes for the same device use latest-value-wins.
+See the [English queue guide](custom_components/cul_max/README.en.md#inspecting-and-controlling-the-transmission-queue)
+or [German queue guide](custom_components/cul_max/README.md#sendewarteschlange-verwalten)
+for actions, installation, cancellation limits and simulation tests.

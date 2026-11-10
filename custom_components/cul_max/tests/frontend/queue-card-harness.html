@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Queue card simulated HA</title>
+<style>
+  :root { --primary-text-color:#202124;--secondary-text-color:#61666b;--primary-color:#0077a8;--secondary-background-color:#f3f6f8;--divider-color:#dae0e3;--error-color:#b3261e;--card-background-color:#fff;--disabled-text-color:#899096; }
+  body { margin:16px;font:15px system-ui;background:var(--secondary-background-color);color:var(--primary-text-color); }
+  ha-card { display:block;border-radius:14px;box-shadow:0 2px 10px #0001; }
+  cul-max-queue-card { display:block;max-width:680px;margin:auto; }
+  body.dark { --primary-text-color:#e3e8ed;--secondary-text-color:#acb6be;--primary-color:#73c9f3;--secondary-background-color:#141c22;--divider-color:#35434d;--error-color:#ffb4ab;--card-background-color:#202a32;--disabled-text-color:#75838e; }
+</style>
+<script src="../../frontend/cul-max-queue-card.js"></script>
+<cul-max-queue-card></cul-max-queue-card>
+<script>
+  const listeners = new Map();
+  const sample = () => ({ config_entry_id:"test",name:"Simulated CUL",budget:{reported_credits:185,budget_valid:true},
+    entries:[
+      {id:"temp",device_address:"06473F",device_name:"Bad",command_type:"SetTemperature",description:"Solltemperatur → 23 °C",scope:"general",status:"waiting_for_credits",cancellable:true,created_at:"2026-11-10T12:00:00Z",attempts:0},
+      {id:"time",device_address:"123456",device_name:"Schlafzimmer mit einem vollständig sichtbaren langen Gerätenamen",command_type:"TimeInformation",description:"Zeitabgleich",scope:"general",status:"awaiting_ack",cancellable:false,blocked_reason:"Bereits übergeben",created_at:"2026-11-10T12:00:00Z",attempts:1},
+    ], jobs:[{id:"profile",device_address:"123456",device_name:"Wohnzimmer",command_type:"WeekProfile",description:"Wochenprofil Montag",scope:"configuration",kind:"climate",status:"queued",steps:[{id:"a"},{id:"b"}],completed_steps:["a"],confirmed_steps:["a"],created_at:"2026-11-10T11:59:00Z"}] });
+  var controller = sample();
+  var calls = [];
+  var failNext = false;
+  var card = document.querySelector("cul-max-queue-card");
+  var hass = {states:{}, connection:{addEventListener:(key,fn)=>listeners.set(key,fn),removeEventListener:(key)=>listeners.delete(key)},
+    callWS: async (call) => {
+      calls.push(call);
+      if (failNext) { failNext=false; throw Error("Status inzwischen geändert"); }
+      const data=call.service_data;
+      if (call.service==="get_queue") return {response:{controllers:[structuredClone(controller)],entries:structuredClone(controller.entries),jobs:structuredClone(controller.jobs)}};
+      if (call.service==="delete_queue_entry") controller.entries=controller.entries.filter(entry=>!(data.entry_ids||[data.entry_id]).includes(entry.id));
+      if (call.service==="clear_queue") controller.entries=controller.entries.filter(entry=>!entry.cancellable);
+      if (call.service==="cancel_config_job") controller.jobs[0].status="cancelled";
+      return {response:{removed:["temp"],protected:[]}};
+    }};
+  card.setConfig({type:"custom:cul-max-queue-card"});card.hass=hass;
+  window.resetFixture=async()=>{controller=sample();card._message=null;await card._refresh();};
+  window.emptyFixture=async()=>{controller.entries=[];controller.jobs=[];await card._refresh();};
+  window.reconnectFixture=()=>listeners.get("ready")?.();
+</script>
