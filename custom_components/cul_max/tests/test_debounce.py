@@ -15,7 +15,7 @@ import test_credit as transport
 mod = transport.mod
 
 
-def load_climate():
+def load_climate(*, native=False):
     class Mode(StrEnum):
         AUTO = "auto"
         HEAT = "heat"
@@ -32,7 +32,14 @@ def load_climate():
         def async_on_remove(self, unsubscribe):
             self._removers = getattr(self, "_removers", []) + [unsubscribe]
         def async_write_ha_state(self):
-            self.published = getattr(self, "published", []) + [self._attr_target_temperature]
+            temperature = self._attr_native_target_temperature if native else self._attr_target_temperature
+            self.published = getattr(self, "published", []) + [temperature]
+        def __setattr__(self, key, value):
+            if native and key in {"_attr_temperature_unit", "_attr_current_temperature", "_attr_target_temperature"}:
+                raise AssertionError(f"Deprecated temperature attribute: {key}")
+            super().__setattr__(key, value)
+    if native:
+        Entity.native_temperature_unit = property(lambda self: self._attr_native_temperature_unit)
     climate = types.ModuleType("homeassistant.components.climate")
     climate.ClimateEntity = Entity
     climate.ClimateEntityFeature = Feature
@@ -48,11 +55,14 @@ def load_climate():
     entity.DeviceInfo = lambda **kwargs: kwargs
     platform = types.ModuleType("homeassistant.helpers.entity_platform")
     platform.AddEntitiesCallback = object
+    exceptions = types.ModuleType("homeassistant.exceptions")
+    exceptions.ServiceValidationError = type("ServiceValidationError", (ValueError,), {})
     sys.modules["_cul_budget_tests"].CulMaxConfigEntry = object
     stubs = {"homeassistant": types.ModuleType("homeassistant"),
         "homeassistant.components": types.ModuleType("homeassistant.components"),
         "homeassistant.components.climate": climate, "homeassistant.const": const,
         "homeassistant.core": core, "homeassistant.helpers": types.ModuleType("homeassistant.helpers"),
+        "homeassistant.exceptions": exceptions,
         "homeassistant.helpers.entity": entity, "homeassistant.helpers.entity_platform": platform}
     with patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location("_cul_budget_tests.climate", Path(__file__).parents[1] / "climate.py")
@@ -71,6 +81,7 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         await transport.CreditTests.asyncSetUp(self)
+        self.c._update_device_state = mod.CulMaxCoordinator._update_device_state.__get__(self.c)
         self.waiters = []
         async def wait_deadline(intent):
             while self.clock.time() < intent.deadline:
@@ -98,6 +109,9 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         for deadline, event in list(self.waiters):
             if self.clock.time() >= deadline:
                 event.set()
+        for intent in self.c._desired_temperatures.values():
+            if intent.reconcile_deadline is not None and self.clock.time() >= intent.reconcile_deadline:
+                self.c._expire_temperature_reconciliation(intent.address, intent.generation)
         self.c._radio_changed.set()
         self.c._command_queue._ready.set()
         await self.settle()
@@ -219,7 +233,7 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         newer = self.request(23)
         await self.settle()
         report = types.SimpleNamespace(mode=1, desired_temperature=20, measured_temperature=19, valve_position=0)
-        entity._on_message(None, report)
+        await self.c._update_device_state("123456", report.__dict__)
         self.assertEqual(entity._attr_target_temperature, 23)
         self.cul.feed(transport.ack_line(self.cul.frames[0]))
         await asyncio.wait_for(old, .5)
@@ -298,7 +312,7 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.get_temperature_intent("123456").entry.status, "failed")
         self.assertEqual(entity._attr_target_temperature, 20)
 
-    async def test_post_ack_report_becomes_authoritative(self):
+    async def test_conflicting_post_ack_report_is_bounded_by_grace_period(self):
         entity = await self.entity()
         task = self.request(23)
         await self.settle()
@@ -306,7 +320,9 @@ class DebounceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, .5)
         self.assertEqual(entity._attr_target_temperature, 23)
         report = types.SimpleNamespace(mode=0, desired_temperature=21, measured_temperature=19, valve_position=0)
-        entity._on_message(None, report)
+        await self.c._update_device_state("123456", report.__dict__)
+        self.assertEqual(entity._attr_target_temperature, 23)
+        await self.advance(30.01)
         self.assertEqual(entity._attr_target_temperature, 21)
         self.assertEqual(entity._attr_hvac_mode, "auto")
         self.assertFalse(self.c.get_temperature_intent("123456").overlay)

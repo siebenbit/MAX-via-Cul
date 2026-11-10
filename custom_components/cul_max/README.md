@@ -1042,14 +1042,15 @@ Die Climate-Entität zeigt den angenommenen Sollwert **sofort** an. Mehrere schn
 Plus-/Minus-Klicks bauen auf diesem gewünschten Wert auf. Die zuletzt gemeldete
 Gerätetemperatur bleibt getrennt gespeichert. Während des Debouncings und der
 anschließenden Übertragung setzen ältere Zustandsmeldungen oder abgeschlossene
-Vorgänger den neuen Wunsch nicht zurück. Nach einem Geräte-ACK übernimmt die
-nächste Zustandsmeldung wieder die Anzeige. Auto ohne expliziten Sollwert wird
-nicht als 0 °C angezeigt. Bei fehlgeschlagenem oder manuell abgebrochenem Wunsch
-kehrt die Anzeige zum zuletzt gemeldeten Sollwert zurück.
+Vorgänger den neuen Wunsch nicht zurück. ACK und Gerätezustand werden getrennt
+abgeglichen; siehe [Konsistente Thermostatzustände](#konsistente-thermostatzustände).
+Auto ohne expliziten Sollwert wird nicht als 0 °C angezeigt. Vor dem Versand
+abgebrochene Wünsche setzen Temperatur und Modus auf die neuesten gemeldeten
+Werte zurück. Ein ACK-Timeout nach möglichem Versand gilt als unbestätigt.
 
 Zusätzliche Climate-Attribute:
 
-- `requested_target_temperature`: zuletzt angenommener gewünschter Sollwert
+- `requested_target_temperature`: aktuell angezeigter gewünschter Sollwert, sonst `null`
 - `reported_target_temperature`: zuletzt vom Gerät gemeldeter Sollwert
 - `temperature_command_status`: Debounce-, Queue- oder Abschlussstatus
 
@@ -1179,3 +1180,72 @@ FHEM erzeugt je Zeitabgleich eine Anforderung; seine generische Retry-Behandlung
 ist davon getrennt. Eine unveränderte reale Zustellrate des einzelnen Zeitpakets
 wurde ohne Hardwaretests nicht nachgewiesen. Die Änderungen sind mit simulierten
 CUL-Antworten geprüft; sie erfordern keine Firmwareänderung oder neue Abhängigkeit.
+
+## Konsistente Thermostatzustände
+
+Der Coordinator berechnet Temperatur, Betriebsmodus und Preset gemeinsam aus dem
+zuletzt gemeldeten Gerätezustand und dem aktuellen Benutzerwunsch. Gerätemeldungen
+aktualisieren den gespeicherten tatsächlichen Zustand jederzeit, auch während
+Debouncing und Budgetwartezeit. Beim Löschen eines ungesendeten Befehls fällt die
+Anzeige sofort auf diese **inzwischen neuesten** gemeldeten Werte zurück. Dafür
+wird kein Rücksetzkommando gesendet. Ersetzte Vorgänger können einen neueren
+Wunsch nicht überschreiben.
+
+Ein ACK bestätigt die Annahme eines Kommandos, keine vollständige Statusmeldung.
+Nach ACK bleibt der Wunsch höchstens **30 Sekunden** sichtbar (`acknowledged`).
+Eine passende, nach der TCP-Übergabe empfangene Meldung beendet die Phase sofort
+(`synchronized`). Widersprüchliche Meldungen werden gespeichert und nach Ablauf
+angezeigt, auch wenn kein weiteres Paket eingeht. Weil MAX! keine sichere zeitliche
+Einordnung unaufgeforderter Meldungen erlaubt, kann eine echte lokale Änderung
+innerhalb dieser kurzen Phase vorübergehend verdeckt werden. Anschließend haben
+lokale Bedienung und Wochenprogramm wieder sofort Vorrang. Gerätemeldungen
+veranlassen niemals eine erneute Übertragung des alten Benutzerwunsches.
+
+ACK-Timeout oder Verbindungsfehler nach möglichem Versand bedeutet `unconfirmed`,
+mit derselben begrenzten Abgleichphase. Eindeutiges Scheitern vor dem Versand
+bedeutet `failed` und setzt die Anzeige sofort zurück. Firmwarefehler `ZERR1/2`
+liegen vor der Paketübergabe; `ZERR3` kann nach einem Versand auftreten. Ein später
+abgewiesener Retry macht einen früheren unbestätigten Versuch nicht ungeschehen.
+Ohne passenden Bericht bleibt nach der Frist `acknowledged` beziehungsweise
+`unconfirmed` erkennbar; ein Erfolg des Zustandsabgleichs wird nicht erfunden.
+
+| MAX!-Betriebsart | HA-Modus | Preset | Deutsche Anzeige |
+| --- | --- | --- | --- |
+| Automatik | `auto` | `none` | Automatik |
+| Manuell | `heat` | `none` | **Manuell** |
+| Boost | `heat` | `boost` | Manuell, Preset Boost |
+| Urlaub / temporär bis | `heat` | `away` | Manuell, Preset Urlaub |
+| Manuell 4,5 °C | `off` | `none` | Aus (Frostschutz) |
+
+Frostschutz ist kein vollständiges Abschalten. Automatik bei 4,5 °C bleibt
+Automatik. Temperaturänderungen übernehmen den wirksamen Modus einschließlich
+einer vorhandenen Urlaubs-Endzeit. Preset `none` beendet Sonderbetrieb und wählt
+Automatik. Neuen Urlaub über `cul_max.set_desired_temperature` mit `temperature`
+und `until` starten; die Preset-Auswahl erfindet keine Endzeit. Urlaub wird dort
+angeboten, wenn eine Endzeit bekannt oder Urlaub bereits aktiv ist.
+
+`hvac_action` bleibt unbekannt: Aus einem geöffneten Ventil lässt sich keine
+tatsächliche Wärmezufuhr beweisen. Die Standardkarte zeigt daher den Betriebsmodus
+an. Heizkörperthermostate erhalten zusätzlich den Prozent-Sensor **Ventilstellung**.
+Dieser und das Climate-Attribut `valve_position` enthalten den letzten wirklich
+gemeldeten Wert; sein Alter ist über `last_reported_at` beziehungsweise
+`valve_position_reported_at` sichtbar. Für Wandthermostate wird kein Ventilwert
+erfunden. Auch unbekannter Modus oder Sollwert erhalten keine erfundenen Vorgaben.
+
+Zusätzliche Climate-Attribute:
+
+- `requested_target_temperature`, `requested_mode`: aktueller Anzeigewunsch, sonst `null`.
+- `reported_target_temperature`, `reported_mode`: neueste tatsächliche Gerätemeldung.
+- `command_status`: Queue-Status, `acknowledged`, `synchronized`, `unconfirmed` oder Abbruch-/Fehlerstatus.
+- `temperature_command_status`: kompatibler Alias für `command_status`.
+- `state_source`: `requested` oder `reported`.
+
+Unvollständige Wandthermostatmeldungen überschreiben keine fehlenden Felder wie
+Modus, Batterie, Ventilstellung oder Endzeit. Ein gemeldeter Moduswechsel kann
+veraltete Sonderwerte ausdrücklich löschen. Beim Neustart werden ausschließlich
+Gerätemeldungen wiederhergestellt; Benutzerwünsche und Abgleichtimer werden nicht
+gespeichert. Entladen beendet die Timer. Alte, künstlich erzeugte Wand-Ventilwerte
+und Wand-Modi ohne nachweisbare Statusherkunft werden verworfen; der nächste volle
+Wandbericht liefert den Modus wieder. Entitäts-IDs bleiben erhalten. Aktuelle
+HA-Versionen verwenden die native Temperatur-API; ältere unterstützte Versionen
+behalten einen Kompatibilitätszweig.

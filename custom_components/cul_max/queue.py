@@ -53,6 +53,8 @@ class QueueEntry:
     attempts: int = 0
     last_error: str | None = None
     has_been_sent: bool = False
+    # TCP handoff is uncertain until an ACK or an explicit firmware rejection.
+    may_have_transmitted: bool = False
     budget_delayed: bool = False
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ready_task: asyncio.Future | None = None
@@ -171,7 +173,7 @@ class CommandQueueManager:
         entry.attempts += 1
         self.set_status(entry, "sending")
 
-    def finish(self, entry: QueueEntry, status: str, *, ack=None, error=None) -> None:
+    def finish(self, entry: QueueEntry, status: str, *, ack=None, error=None, notify: bool = True) -> None:
         if entry.status in TERMINAL:
             return
         self._remove_readiness_callback(entry)
@@ -194,7 +196,8 @@ class CommandQueueManager:
                 entry.future.set_exception(error)
             else:
                 entry.future.set_result(CommandResult(status, ack))
-        self.notify()
+        if notify:
+            self.notify()
 
     def delete(self, entry_id: str) -> None:
         entry = self._entries.get(entry_id)

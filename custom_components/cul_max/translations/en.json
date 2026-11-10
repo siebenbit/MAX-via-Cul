@@ -1,0 +1,22 @@
+{
+  "entity": {
+    "climate": {
+      "thermostat": {
+        "state": {
+          "auto": "Automatic",
+          "heat": "Manual",
+          "off": "Off (frost protection)"
+        },
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "None",
+              "boost": "Boost",
+              "away": "Holiday"
+            }
+          }
+        }
+      }
+    }
+  }
+}

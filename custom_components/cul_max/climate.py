@@ -1,25 +1,22 @@
 """Climate entities for MAX! thermostats (HeatingThermostat + WallMountedThermostat)."""
 from __future__ import annotations
 
-import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
-    HVACAction,
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 
 from . import CulMaxConfigEntry
 from .const import (
-    DEVICE_HEATING_THERMOSTAT,
-    DEVICE_HEATING_THERMOSTAT_PLUS,
-    DEVICE_WALL_THERMOSTAT,
     DOMAIN,
     MODE_AUTO,
     MODE_BOOST,
@@ -33,19 +30,13 @@ from .const import (
 from .coordinator import CulMaxCoordinator, KnownDevice
 from .protocol import (
     MaxMessage,
-    ThermostatState,
     format_week_profile_by_day,
     format_week_profile_lines,
 )
 
-_LOGGER = logging.getLogger(__name__)
-
-HVAC_MODE_MAP = {
-    MODE_AUTO:    HVACMode.AUTO,
-    MODE_MANUAL:  HVACMode.HEAT,
-    2:            HVACMode.AUTO,   # vacation — treat as auto
-    MODE_BOOST:   HVACMode.HEAT,
-}
+# HA 2026.11 introduced native temperature properties. Keep older supported HA
+# versions working without defining deprecated members on current HA.
+_NATIVE_TEMPERATURE_API = hasattr(ClimateEntity, "native_temperature_unit")
 
 
 async def async_setup_entry(
@@ -90,7 +81,11 @@ class CulMaxClimate(ClimateEntity):
 
     _attr_has_entity_name = False
     _attr_name = None
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_translation_key = "thermostat"
+    if _NATIVE_TEMPERATURE_API:
+        _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    else:
+        _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = TEMP_MIN
     _attr_max_temp = TEMP_MAX
     _attr_target_temperature_step = 0.5
@@ -99,13 +94,12 @@ class CulMaxClimate(ClimateEntity):
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.PRESET_MODE
     )
-    _attr_preset_modes = ["boost"]
+    _attr_preset_modes = ["none", "boost"]
 
     def __init__(self, coordinator: CulMaxCoordinator, device: KnownDevice) -> None:
         self._coordinator = coordinator
         self._device = device
         self._address = device.address
-        self._state: ThermostatState | None = None
 
         self._attr_unique_id = f"{DOMAIN}_{self._address}"
         self._attr_device_info = DeviceInfo(
@@ -115,96 +109,47 @@ class CulMaxClimate(ClimateEntity):
             model=coordinator.get_device_registry_model(device),
         )
 
-        # Set default values to prevent AttributeError
-        self._attr_hvac_mode = HVACMode.OFF
-        self._attr_target_temperature = None
-        self._attr_current_temperature = None
-        self._attr_hvac_action = HVACAction.IDLE
-        self._attr_preset_mode = "manual"
-        self._attr_available = False
+        self._apply_display_state()
 
-    def _raw_mode(self) -> int:
-        """Return the desired mode while pending, otherwise the reported mode."""
-        intent = self._coordinator.get_temperature_intent(self._address)
-        if intent is not None and intent.overlay:
-            return intent.mode
-        if self._state is not None:
-            return self._state.mode
-        last = self._device.last_state or {}
-        mode = last.get("mode")
-        return int(mode) if mode is not None else MODE_MANUAL
-
-    def _temperature_write_mode(self) -> int:
-        """Choose a SetTemperature mode that preserves the current operating style."""
-        intent = self._coordinator.get_temperature_intent(self._address)
-        if intent is not None and intent.overlay:
-            return intent.mode
-        raw_mode = self._raw_mode()
-        if raw_mode in (MODE_AUTO, MODE_VACATION):
-            return MODE_AUTO
-        return MODE_MANUAL
+    def _raw_mode(self) -> int | None:
+        return self._coordinator.get_display_state(self._address)["mode"]
 
     async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            self._coordinator.add_listener(self._address, self._on_message)
-        )
         self.async_on_remove(
             self._coordinator.add_week_profile_listener(self._address, self._on_week_profile_update)
         )
         self.async_on_remove(
             self._coordinator.add_temperature_listener(self._address, self._on_temperature_intent)
         )
-        # Restore last known state if available
-        last = self._device.last_state
-        if last:
-            self._apply_state_dict(last)
-            self._attr_available = True
-
-    @callback
-    def _on_message(self, msg: MaxMessage, decoded: ThermostatState | None) -> None:
-        if decoded is None:
-            return
-        self._state = decoded
-        self._coordinator.temperature_report_received(self._address)
-        self._apply_state_dict(decoded.__dict__)
-        self._attr_available = True
-        self.async_write_ha_state()
+        self._apply_display_state()
 
     @callback
     def _on_temperature_intent(self) -> None:
-        reported = self._state.__dict__ if self._state is not None else self._device.last_state or {}
-        self._apply_state_dict(reported)
+        # Also called for unsolicited and partial reports, without queue activity.
+        self._apply_display_state()
         self.async_write_ha_state()
-
-    def _apply_desired_temperature(self) -> None:
-        intent = self._coordinator.get_temperature_intent(self._address)
-        if intent is not None and intent.overlay:
-            if intent.display_temperature is not None:
-                self._attr_target_temperature = intent.display_temperature
-            self._attr_hvac_mode = HVAC_MODE_MAP.get(intent.mode, HVACMode.HEAT)
-            self._attr_preset_mode = "boost" if intent.mode == MODE_BOOST else None
 
     @callback
     def _on_week_profile_update(self) -> None:
-        """Refresh attributes when the stored week profile changes."""
         self.async_write_ha_state()
 
-    def _apply_state_dict(self, state: dict) -> None:
-        """Apply state dict (from ThermostatState or stored last_state)."""
-        self._attr_target_temperature = state.get("desired_temperature")
-        self._attr_current_temperature = state.get("measured_temperature")
-        mode = state.get("mode", MODE_MANUAL)
-        self._attr_hvac_mode = HVAC_MODE_MAP.get(mode, HVACMode.HEAT)
-        self._attr_preset_mode = "boost" if mode == MODE_BOOST else None
-
-        self._apply_desired_temperature()
-        valve = state.get("valve_position", 0)
-        if self._attr_hvac_mode == HVACMode.OFF:
-            self._attr_hvac_action = HVACAction.IDLE
-        elif valve and valve > 0:
-            self._attr_hvac_action = HVACAction.HEATING
+    def _apply_display_state(self) -> None:
+        state = self._coordinator.get_display_state(self._address)
+        self._attr_hvac_mode = HVACMode(state["hvac_mode"]) if state["hvac_mode"] else None
+        self._attr_preset_mode = state["preset_mode"]
+        self._attr_hvac_action = None
+        if _NATIVE_TEMPERATURE_API:
+            self._attr_native_target_temperature = state["target_temperature"]
+            self._attr_native_current_temperature = state["current_temperature"]
         else:
-            self._attr_hvac_action = HVACAction.IDLE
+            self._attr_target_temperature = state["target_temperature"]
+            self._attr_current_temperature = state["current_temperature"]
+        self._attr_available = any(state[key] is not None for key in
+                                   ("mode", "target_temperature", "current_temperature"))
+        self._attr_preset_modes = ["none", "boost"]
+        until = state["until"]
+        if state["preset_mode"] == "away" or (until and until.timestamp() > datetime.now().timestamp()):
+            self._attr_preset_modes.append("away")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -259,61 +204,69 @@ class CulMaxClimate(ClimateEntity):
             )
             if effective_week_profile != self._device.week_profile:
                 attrs["week_profile_source"] = "linked_partner"
-        if self._state and hasattr(self._state, 'valve_position'):
-            attrs["valve_position"] = self._state.valve_position
-            attrs["battery_low"] = self._state.battery_low
-            attrs["rf_error"] = self._state.rf_error
-            attrs["panel_locked"] = self._state.panel_locked
-            if self._state.display_actual_temperature is not None:
-                attrs["display_actual_temperature"] = self._state.display_actual_temperature
-            if self._state.heater_temperature is not None:
-                attrs["heater_temperature"] = self._state.heater_temperature
-            if self._state.until is not None:
-                attrs["until"] = self._state.until
-            if self._state.boost_duration is not None:
-                attrs["boost_duration_min"] = self._state.boost_duration
-        intent = self._coordinator.get_temperature_intent(self._address)
-        reported = self._state.__dict__ if self._state is not None else self._device.last_state or {}
-        attrs.update({
-            "requested_target_temperature": intent.display_temperature if intent else None,
-            "reported_target_temperature": reported.get("desired_temperature"),
-            "temperature_command_status": intent.entry.status if intent else None,
-        })
+        state = self._coordinator.get_display_state(self._address)
+        reported = state["reported"]
+        for key in ("valve_position", "valve_position_reported_at", "reported_at", "battery_low",
+                    "rf_error", "panel_locked", "display_actual_temperature", "heater_temperature"):
+            if key in reported:
+                attrs[key] = reported[key]
+        attrs["until"] = state["until"].isoformat() if state["until"] else None
+        attrs["boost_duration_min"] = reported.get("boost_duration") if state["mode"] == MODE_BOOST else None
+        for key in ("requested_target_temperature", "reported_target_temperature", "requested_mode",
+                    "reported_mode", "command_status", "state_source"):
+            attrs[key] = state[key]
+        attrs["temperature_command_status"] = state["command_status"]
         return attrs
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        mode = self._temperature_write_mode()
-        intent = self._coordinator.get_temperature_intent(self._address)
-        until = intent.until if intent and intent.overlay and mode == MODE_VACATION else None
+        state = self._coordinator.get_display_state(self._address)
+        mode = state["mode"]
+        if "hvac_mode" in kwargs:
+            mode = {HVACMode.AUTO: MODE_AUTO, HVACMode.HEAT: MODE_MANUAL,
+                    HVACMode.OFF: MODE_MANUAL}.get(kwargs["hvac_mode"])
+            if kwargs["hvac_mode"] == HVACMode.OFF:
+                temperature = TEMP_MIN
+        if mode is None:
+            raise ServiceValidationError("Betriebsmodus unbekannt; zuerst Automatik oder Manuell wählen.")
+        until = state["until"] if mode == MODE_VACATION else None
+        if mode == MODE_VACATION and (until is None or until.timestamp() <= datetime.now().timestamp()):
+            raise ServiceValidationError("Urlaub benötigt eine gültige Endzeit (until).")
         await self._coordinator.async_set_temperature(
             self._address, temperature, mode=mode, until=until,
         )
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            await self._coordinator.async_set_temperature(
-                self._address, TEMP_MIN, mode=MODE_MANUAL
-            )
+            await self._coordinator.async_set_temperature(self._address, TEMP_MIN, mode=MODE_MANUAL)
         elif hvac_mode == HVACMode.AUTO:
-            await self._coordinator.async_set_temperature(
-                self._address,
-                0.0,
-                mode=MODE_AUTO,
-            )
+            await self._coordinator.async_set_temperature(self._address, 0.0, mode=MODE_AUTO)
+        elif hvac_mode == HVACMode.HEAT:
+            temperature = self._coordinator.get_display_state(self._address)["target_temperature"]
+            if temperature is None:
+                raise ServiceValidationError("Solltemperatur unbekannt; zuerst eine Temperatur angeben.")
+            await self._coordinator.async_set_temperature(self._address, temperature, mode=MODE_MANUAL)
         else:
-            await self._coordinator.async_set_temperature(
-                self._address,
-                self._attr_target_temperature or 20.0,
-                mode=MODE_MANUAL,
-            )
+            raise ServiceValidationError(f"Nicht unterstützter Betriebsmodus: {hvac_mode}")
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        mode = MODE_BOOST if preset_mode == "boost" else self._temperature_write_mode()
-        await self._coordinator.async_set_temperature(
-            self._address,
-            self._attr_target_temperature or 20.0,
-            mode=mode,
-        )
+        if preset_mode == "none":
+            await self.async_set_hvac_mode(HVACMode.AUTO)
+        elif preset_mode == "boost":
+            await self._coordinator.async_set_temperature(self._address, 0.0, mode=MODE_BOOST)
+        elif preset_mode == "away":
+            state = self._coordinator.get_display_state(self._address)
+            until = state["until"]
+            if until is None or until.timestamp() <= datetime.now().timestamp():
+                raise ServiceValidationError(
+                    "Urlaub über cul_max.set_desired_temperature mit Temperatur und until starten."
+                )
+            if state["target_temperature"] is None:
+                raise ServiceValidationError("Solltemperatur für Urlaub unbekannt.")
+            await self._coordinator.async_set_temperature(
+                self._address, state["target_temperature"], mode=MODE_VACATION, until=until,
+            )
+        else:
+            raise ServiceValidationError(f"Nicht unterstütztes Preset: {preset_mode}")

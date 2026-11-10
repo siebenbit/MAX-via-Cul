@@ -14,7 +14,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from . import CulMaxConfigEntry
-from .const import CLIMATE_DEVICE_TYPES, DOMAIN
+from .const import CLIMATE_DEVICE_TYPES, DEVICE_HEATING_THERMOSTAT, DEVICE_HEATING_THERMOSTAT_PLUS, DOMAIN
 from .coordinator import CulMaxCoordinator, KnownDevice
 from .protocol import MaxMessage, format_week_profile_lines
 
@@ -142,6 +142,38 @@ class CulMaxCreditSensor(SensorEntity):
     def _on_timer(self, _now) -> None:
         if self.extra_state_attributes["waiting_packets"]:
             self.async_write_ha_state()
+
+
+class CulMaxValvePositionSensor(SensorEntity):
+    """Last reported valve position; this is not proof of heat delivery."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Ventilstellung"
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:valve"
+
+    def __init__(self, coordinator: CulMaxCoordinator, device: KnownDevice) -> None:
+        self._coordinator = coordinator
+        self._device = device
+        self._attr_unique_id = f"{DOMAIN}_{device.address}_valve_position"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, device.address)}, name=device.name)
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.last_state.get("valve_position")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"last_reported_at": self._device.last_state.get("valve_position_reported_at")}
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._coordinator.add_temperature_listener(self._device.address, self._changed))
+
+    @callback
+    def _changed(self) -> None:
+        self.async_write_ha_state()
 
 
 class CulMaxLastSeenSensor(SensorEntity):
@@ -677,4 +709,6 @@ def _build_diagnostic_entities(
     if device.device_type in CLIMATE_DEVICE_TYPES:
         entities.insert(3, CulMaxExpectedWeekProfileTemperatureSensor(coordinator, device))
         entities.insert(4, CulMaxWeekProfileValidationSensor(coordinator, device))
+    if device.device_type in (DEVICE_HEATING_THERMOSTAT, DEVICE_HEATING_THERMOSTAT_PLUS):
+        entities.append(CulMaxValvePositionSensor(coordinator, device))
     return entities

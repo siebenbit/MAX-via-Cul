@@ -720,9 +720,11 @@ but never admits a request before two seconds of inactivity.
 The climate entity immediately displays the accepted desired value so repeated
 plus/minus clicks build on the new target. Reported device state remains separate.
 Old reports and completed predecessor requests cannot overwrite a newer pending
-intent. After the device ACK, the next thermostat report becomes authoritative.
-Automatic mode without a temperature never displays a 0 °C target. Failure or
-manual cancellation restores the most recently reported target.
+intent. ACK and device state are reconciled separately; see
+[Consistent thermostat state](#consistent-thermostat-state). Automatic mode without
+a temperature never displays a 0 °C target. Cancellation before transmission
+restores the latest reported temperature and mode; a timeout after a possible
+transmission remains unconfirmed.
 
 Climate attributes distinguish `requested_target_temperature`,
 `reported_target_temperature` and `temperature_command_status`.
@@ -826,3 +828,73 @@ Sources: [CULFW32 0.2.12 costs](https://github.com/tostmann/culfw32/blob/1ce78f1
 FHEM schedules one time request; its generic retries are separate. Single-packet
 radio delivery is not hardware-verified. Automated checks use simulated CUL
 responses; no firmware changes or new integration dependencies are needed.
+
+## Consistent thermostat state
+
+The coordinator calculates the entire climate display from the last reported
+device state and the latest `TemperatureIntent`. Temperature, operating mode and
+preset change together. Device reports always update the stored actual state,
+including while a Home Assistant command is debouncing or waiting for credits.
+Cancelling an unsent command restores these latest reported values immediately,
+without transmitting a rollback command. Superseded generations cannot change a
+newer request. Two-second debouncing, queue cancellation and RF admission remain
+in force.
+
+An ACK confirms command acceptance, not a full state report. The climate entity
+shows `acknowledged` and keeps the requested settings for **at most 30 seconds**
+after the ACK. A matching report received after the command's TCP handoff ends
+this period immediately (`synchronized`). Reports with different values are
+stored immediately and become visible when the period expires, even if no more
+packets arrive. MAX! does not reliably timestamp unsolicited reports: a real
+local change within this short period can therefore be temporarily hidden.
+After reconciliation, local controls and weekly schedule changes take immediate
+precedence. Reports never trigger enforcement or retransmission of an old wish.
+
+An ACK timeout or uncertain TCP failure after a possible transmission is
+`unconfirmed`, with the same bounded reconciliation. A definite failure before
+transmission is `failed` and restores reported values immediately. Firmware
+`ZERR1/2` are pre-frame errors; `ZERR3` can occur after transmission and remains
+uncertain. An earlier uncertain attempt is not erased by a rejected retry.
+After the 30 seconds, ACK success remains `acknowledged`, or lack of confirmation
+remains `unconfirmed`, unless an actual matching report establishes synchronization.
+
+| MAX! setting | HA state | Preset | German label |
+| --- | --- | --- | --- |
+| Automatic schedule | `auto` | `none` | Automatik |
+| Manual target | `heat` | `none` | Manuell |
+| Boost | `heat` | `boost` | Manuell, preset Boost |
+| Holiday / temporary until | `heat` | `away` | Manuell, preset Urlaub |
+| Manual 4.5 °C | `off` | `none` | Aus (Frostschutz) |
+
+`off` means frost protection, not a fully disabled radiator. Automatic mode at
+4.5 °C remains automatic. A target edit preserves the effective mode and an
+existing holiday end time. Selecting `none` ends a special preset and selects
+automatic mode. Start a new holiday through `cul_max.set_desired_temperature`
+with `temperature` and `until`; the preset selector does not invent an end date.
+The `away` option is available when an end time is known (or holiday is active).
+Unknown temperatures and modes are not replaced with invented defaults.
+
+`hvac_action` is deliberately omitted: an open valve does not prove heat is being
+supplied. The standard thermostat card therefore displays the operating mode.
+Radiator devices also expose a **Ventilstellung** percentage sensor, and the
+`valve_position` climate attribute, both retaining the last real reported value.
+`last_reported_at` on the sensor and `valve_position_reported_at` on the climate
+entity identify its age. Wall thermostats do not report a valve position.
+
+Additional climate attributes:
+
+- `requested_target_temperature`, `requested_mode`: active display overlay, otherwise `null`.
+- `reported_target_temperature`, `reported_mode`: latest actual device report.
+- `command_status`: queue progress, `acknowledged`, `synchronized`, `unconfirmed`, or terminal cancellation/failure.
+- `temperature_command_status`: compatibility alias of `command_status`.
+- `state_source`: `requested` or `reported`.
+
+Partial wall control reports update only the temperatures they contain. Missing
+mode, battery, valve, measured temperature or end-time fields do not erase known
+values; a reported mode change can explicitly clear obsolete special-mode data.
+On reload or restart, only actual reports are restored. Intents and reconciliation
+timers are never persisted, and unload cancels their timers. Legacy fabricated
+wall valve values and wall modes lacking report provenance are discarded; the
+next full wall status supplies the mode again. Entity IDs remain unchanged.
+Current HA uses the native temperature API; earlier supported versions retain a
+compatibility path.

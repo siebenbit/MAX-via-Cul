@@ -255,3 +255,15 @@ pending sync requests and avoids unnecessary auto-mode follow-ups and confirmed
 retransmissions. The existing credit sensor also exposes per-command traffic
 estimates. See the [radio traffic guide](custom_components/cul_max/README.en.md#reducing-radio-traffic-version-014)
 for costs and the limits of these estimates.
+
+## Thermostat state and modes
+
+The standard thermostat card immediately displays pending changes, while the
+integration keeps actual device reports separate. Cancelling an unsent change
+restores the latest reported temperature, mode and preset together. Acknowledged
+or uncertain transmissions use a bounded 30-second reconciliation period;
+subsequent local changes and schedule transitions are never permanently hidden.
+The German manual-mode label is **Manuell**. Valve position is reported separately
+without inferring heating activity. See the
+[English state guide](custom_components/cul_max/README.en.md#consistent-thermostat-state)
+or [German state guide](custom_components/cul_max/README.md#konsistente-thermostatzustände).

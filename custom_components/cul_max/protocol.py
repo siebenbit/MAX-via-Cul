@@ -32,6 +32,7 @@ from .const import (
     MODE_AUTO,
     MODE_BOOST,
     MODE_MANUAL,
+    MODE_VACATION,
     MODE_NAMES,
     MSG_ACK,
     MSG_PAIR_PING,
@@ -130,19 +131,26 @@ class MaxMessage:
 class ThermostatState:
     """Decoded thermostat state."""
     address: str
-    mode: int
-    battery_low: bool
-    rf_error: bool
-    panel_locked: bool
-    gateway_known: bool
-    dst_active: bool
-    valve_position: int         # 0-100 %
+    mode: int | None
+    battery_low: bool | None
+    rf_error: bool | None
+    panel_locked: bool | None
+    gateway_known: bool | None
+    dst_active: bool | None
+    valve_position: int | None  # 0-100 %, absent on wall thermostats
     desired_temperature: float  # °C
     measured_temperature: float | None  # °C, None if not available
     boost_duration: int | None  # minutes, only in boost mode
     display_actual_temperature: bool | None = None
     heater_temperature: float | None = None
     until: str | None = None
+    reported_fields: frozenset[str] | None = None
+
+    def as_reported_state(self) -> dict[str, Any]:
+        """Exclude absent fields, retaining explicit clears (for example until)."""
+        return {key: value for key, value in self.__dict__.items()
+                if key != "reported_fields"
+                and (self.reported_fields is None or key in self.reported_fields)}
 
 
 @dataclass
@@ -548,7 +556,7 @@ def decode_thermostat_state(msg: MaxMessage) -> ThermostatState | None:
             heater_temperature_raw = payload[4] if len(payload) > 4 else None
             until3 = payload[5] if len(payload) > 5 else None
             temperature_low = payload[6] if len(payload) > 6 else None
-            valve_pos = 0
+            valve_pos = None
         else:
             flags2 = payload[0]
             valve_pos = payload[1]
@@ -560,7 +568,7 @@ def decode_thermostat_state(msg: MaxMessage) -> ThermostatState | None:
             heater_temperature_raw = None
 
         _LOGGER.debug(
-            "Thermostat %s payload: flags2=0x%02X, valve=%d, desired_raw=0x%02X",
+            "Thermostat %s payload: flags2=0x%02X, valve=%s, desired_raw=0x%02X",
             msg.src_hex,
             flags2,
             valve_pos,
@@ -616,6 +624,22 @@ def decode_thermostat_state(msg: MaxMessage) -> ThermostatState | None:
             boost_raw = payload[3 if is_wall else 4]
             boost_duration = (boost_raw >> 5) * 5  # in minutes
 
+        reported = {"address", "mode", "battery_low", "rf_error", "panel_locked",
+                    "gateway_known", "dst_active", "desired_temperature"}
+        if not is_wall:
+            reported.add("valve_position")
+        if measured_temp is not None:
+            reported.add("measured_temperature")
+        if display_actual_temperature is not None:
+            reported.add("display_actual_temperature")
+        if heater_temperature is not None:
+            reported.add("heater_temperature")
+        # A mode change explicitly clears obsolete special-mode information.
+        if mode != MODE_VACATION or until is not None:
+            reported.add("until")
+        if mode != MODE_BOOST or boost_duration is not None:
+            reported.add("boost_duration")
+
         return ThermostatState(
             address=msg.src_hex,
             mode=mode,
@@ -631,6 +655,7 @@ def decode_thermostat_state(msg: MaxMessage) -> ThermostatState | None:
             display_actual_temperature=display_actual_temperature,
             heater_temperature=heater_temperature,
             until=until,
+            reported_fields=frozenset(reported),
         )
     except (IndexError, ValueError) as e:
         _LOGGER.warning("Failed to decode thermostat state from '%s': %s", msg.raw, e)
@@ -668,19 +693,21 @@ def decode_wall_thermostat_control(msg: MaxMessage) -> ThermostatState | None:
 
         return ThermostatState(
             address=msg.src_hex,
-            mode=MODE_MANUAL,
-            battery_low=msg.battery_low,
-            rf_error=msg.rf_error,
-            panel_locked=False,
-            gateway_known=False,
-            dst_active=bool(msg.flags & 0x04),
-            valve_position=0,
+            mode=None,
+            battery_low=None,
+            rf_error=None,
+            panel_locked=None,
+            gateway_known=None,
+            dst_active=None,
+            valve_position=None,
             desired_temperature=desired_temp,
             measured_temperature=measured_temp,
             boost_duration=None,
             display_actual_temperature=None,
             heater_temperature=None,
             until=None,
+            reported_fields=frozenset({"address", "desired_temperature"}
+                                      | ({"measured_temperature"} if measured_temp is not None else set())),
         )
     except (IndexError, ValueError) as e:
         _LOGGER.warning("Failed to decode wall thermostat control from '%s': %s", msg.raw, e)
