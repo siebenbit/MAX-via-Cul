@@ -16,7 +16,8 @@ test('pairing live results, escaping, controller selection and cleanup', async (
   const c={config_entry_id:'a',name:'CUL',connected:true,active:false,session_id:'s',devices:[{name:'<img>',device_type:'Thermostat',device_id:'abc',area_name:'Bad'}]};
   push({controllers:[c]});
   assert.match(card.shadowRoot.innerHTML,/&lt;img&gt;/);
-  assert.match(card.shadowRoot.innerHTML,/\/config\/devices\/device\/abc/);
+  assert.match(card.shadowRoot.innerHTML,/data-edit="abc"/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML,/href="\/config\/devices/);
   await card._start(); assert.equal(calls[0].config_entry_id,'a'); assert.equal(calls[0].duration,60);
   push({controllers:[c,{...c,config_entry_id:'b'}]});
   assert.equal(card._controller(),null);

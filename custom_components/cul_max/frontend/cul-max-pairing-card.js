@@ -1,4 +1,5 @@
 const { cardStyles } = await import(new URL("./cul-max-card-styles.js" + new URL(import.meta.url).search, import.meta.url));
+const { openDeviceDialog } = await import(new URL("./cul-max-device-dialog.js" + new URL(import.meta.url).search, import.meta.url));
 const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 class CulMaxPairingCard extends HTMLElement {
   static getStubConfig() { return { title: "MAX! Geräte anlernen", duration: 60 }; }
@@ -59,15 +60,37 @@ class CulMaxPairingCard extends HTMLElement {
     } catch (error) { if (epoch === this._epoch) this._error = error.message || String(error); }
     finally { this._busy = false; if (epoch === this._epoch) this._render(); }
   }
+  async _editDevice(deviceId) {
+    if (this._editing || !this._online) return;
+    this._editing = true;
+    this._error = "";
+    this._render();
+    const epoch = this._epoch;
+    try {
+      await openDeviceDialog(this, this._hass, deviceId,
+        () => epoch === this._epoch && this.isConnected && this._online, () => this._hass);
+    } catch (error) {
+      if (epoch === this._epoch) this._error = error.message || String(error);
+    } finally {
+      this._editing = false;
+      if (this.isConnected) {
+        this._render();
+        this.shadowRoot.getElementById(`edit-${deviceId}`)?.focus();
+      }
+    }
+  }
   _render() {
     if (!this._config) return;
     const c = this._controller();
     const focus = this.shadowRoot.activeElement?.id;
     clearInterval(this._timer); this._timer = null;
-    this.shadowRoot.innerHTML = `<style>${cardStyles}
+    // Keep the modal mounted independently of live result-list rendering.
+    if (!this.shadowRoot.querySelector("#pairing-content")) this.shadowRoot.innerHTML = '<div id="pairing-content"></div>';
+    const content = this.shadowRoot.querySelector("#pairing-content") || this.shadowRoot;
+    content.innerHTML = `<style>${cardStyles}
       .device-row{display:grid;grid-template-columns:minmax(0,1fr) 11rem;align-items:start;gap:16px;border-top:1px solid var(--divider-color);padding:16px 0}
       .device-row:first-of-type{border-top:0;padding-top:0}.device-row:last-child{padding-bottom:0}
-      .device-row>.button-link{width:11rem;max-width:100%;justify-self:start}
+      .device-row>.edit-device{width:11rem;max-width:100%;justify-self:start}
       .device-info{min-width:0;overflow-wrap:anywhere;display:grid;gap:6px;justify-items:start}.device-name{font-weight:600;line-height:1.35}.status{margin-top:12px}
       @media(max-width:480px){.device-row{grid-template-columns:minmax(0,1fr);gap:12px}}
       </style><ha-card><div class="header"><h2>${escape(this._config.title)}</h2></div>
@@ -77,7 +100,8 @@ class CulMaxPairingCard extends HTMLElement {
       <div class="status" role="status">${c?.active ? 'Pairing aktiv · <span id="countdown"></span><p class="muted">Jetzt Pairing am Gerät aktivieren.</p>' : c?.session_id ? "Pairing beendet" : c ? "Bereit zum Anlernen" : "Bitte einen geladenen CUL-Anschluss auswählen."}</div>
       ${c && !c.connected ? '<p class="error">CUL ist nicht verbunden.</p>' : ""}
       ${c?.error ? `<p class="error">${escape(c.error)}</p>` : ""}
-      <section><h3>Gefundene Geräte</h3>${(c?.devices || []).map((d) => `<div class="device-row"><div class="device-info"><div class="device-name">${escape(d.name)}</div><div class="muted">${escape(d.device_type)} · ${escape(d.serial_number || d.address)}</div><div>${escape(d.area_name || "Noch keinem Raum zugeordnet")}</div>${d.already_known ? '<span class="badge">Erneut angelernt</span>' : ""}</div>${d.device_id ? `<a class="button-link" href="/config/devices/device/${encodeURIComponent(d.device_id)}">Gerät bearbeiten</a>` : d.removed ? '<small>Gerät nicht mehr vorhanden</small>' : '<small>Gerät wird in HA angelegt</small>'}</div>`).join("") || '<p class="muted">Noch keine Geräte angelernt.</p>'}</section></ha-card>`;
+      <section><h3>Gefundene Geräte</h3>${(c?.devices || []).map((d) => `<div class="device-row"><div class="device-info"><div class="device-name">${escape(d.name)}</div><div class="muted">${escape(d.device_type)} · ${escape(d.serial_number || d.address)}</div><div>${escape(d.area_name || "Noch keinem Raum zugeordnet")}</div>${d.already_known ? '<span class="badge">Erneut angelernt</span>' : ""}</div>${d.device_id ? `<button id="edit-${escape(d.device_id)}" class="edit-device" data-edit="${escape(d.device_id)}" ${this._editing || !this._online ? "disabled" : ""}>Gerät bearbeiten</button>` : d.removed ? '<small>Gerät nicht mehr vorhanden</small>' : '<small>Gerät wird in HA angelegt</small>'}</div>`).join("") || '<p class="muted">Noch keine Geräte angelernt.</p>'}</section></ha-card>`;
+    this.shadowRoot.querySelectorAll("[data-edit]").forEach((button) => button.addEventListener("click", () => this._editDevice(button.dataset.edit)));
     this.shadowRoot.querySelector("#start")?.addEventListener("click", () => this._start());
     this.shadowRoot.querySelector("#controller")?.addEventListener("change", (event) => { this._selected = event.target.value; this._render(); });
     if (focus) this.shadowRoot.getElementById(focus)?.focus();

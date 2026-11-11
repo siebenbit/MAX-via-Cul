@@ -5,5 +5,18 @@ import '../../frontend/cul-max-pairing-card.js?v=fixture';
 window.fixture={controllers:[{config_entry_id:'demo',name:'MAX! CUL',connected:true,session_id:'session',active:true,ends_at:new Date(Date.now()+60000).toISOString(),devices:[{name:'Heizkörperthermostat mit einem langen vollständigen Gerätenamen',device_type:'Heizkörperthermostat',serial_number:'NEQ1234567',device_id:'demo',area_name:null},{name:'Fensterkontakt',device_type:'Fensterkontakt',serial_number:'OEQ7654321',device_id:'window',area_name:'Wohnzimmer',already_known:true}]}]};
 window.card=document.querySelector('cul-max-pairing-card');card.setConfig({});
 window.pushFixture=()=>window.push?.(structuredClone(fixture));
-card.hass={user:{is_admin:true},connection:{addEventListener(){},removeEventListener(){},async subscribeMessage(cb){window.push=cb;pushFixture();return()=>{};}},async callWS(){}};
+card.hass={user:{is_admin:true},connection:{addEventListener(){},removeEventListener(){},async subscribeMessage(cb){window.push=cb;pushFixture();return()=>{};}},async callWS(msg){
+  if(msg.type==='config/device_registry/list')return fixture.controllers[0].devices.map(d=>({id:d.device_id,name:d.name,area_id:d.area_id||null}));
+  if(msg.type==='config/area_registry/list')return [{area_id:'bad',name:'Bad'},{area_id:'living',name:'Wohnzimmer'}];
+  if(msg.type==='config/device_registry/update'){
+    window.saveCalls=(window.saveCalls||0)+1;
+    if(window.failSave)throw Error('Speichern fehlgeschlagen');
+    if(window.holdSave)await new Promise(resolve=>window.releaseSave=resolve);
+    window.savedDevice=msg;
+    const d=fixture.controllers[0].devices.find(d=>d.device_id===msg.device_id);
+    if('name_by_user' in msg)d.name=msg.name_by_user||'Standardname';
+    if('area_id' in msg){d.area_id=msg.area_id;d.area_name=({bad:'Bad',living:'Wohnzimmer'})[msg.area_id]||null;}
+    pushFixture();return {};
+  }
+}};
 </script></html>

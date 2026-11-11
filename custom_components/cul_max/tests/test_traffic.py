@@ -185,7 +185,12 @@ class TrafficTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(self.c._send_command(self.cmd, expected_src="123456", device_address=None,
                 counter=7, description="SetTemperature", timeout=12, retries=0))
             self.tasks.append(task)
-            await asyncio.sleep(.03)
+            # Replace the stream only after the failed post-write barrier has
+            # closed it and scheduled retry. A fixed sleep can race under load.
+            async def failed_barrier():
+                while not old.closed or self.c._credit_retry_at <= self.clock.time():
+                    await asyncio.sleep(.001)
+            await asyncio.wait_for(failed_barrier(), 1)
         self.attach(450)
         return task, old
 

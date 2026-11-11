@@ -1731,20 +1731,24 @@ class CulMaxCoordinator:
                 )
             else:
                 name = auto_name
-            device = KnownDevice(
-                address=src,
-                device_type=device_type,
-                name=name,
-                serial_number=serial_str,
-                firmware_version=str(firmware),
-                paired=True,
-                last_seen=datetime.now(UTC).isoformat(),
-            )
-            self._devices[src] = device
+            # Entities keep this object. Re-pairing refreshes identity, never
+            # replaces stored profiles, links, reports or acknowledged settings.
+            device = existing_device
+            if device is None:
+                device = KnownDevice(address=src, device_type=device_type, name=name)
+                self._devices[src] = device
+            device.device_type = device_type
+            device.name = name
+            if serial_str:
+                device.serial_number = serial_str
+            if firmware:
+                device.firmware_version = str(firmware)
+            device.paired = True
+            device.last_seen = datetime.now(UTC).isoformat()
             await self._ensure_time_slots_assigned()
             superseded_devices = self._mark_superseded_devices(
                 new_address=src,
-                serial_number=serial_str,
+                serial_number=device.serial_number,
                 name=name,
             )
             await self._save_devices()
@@ -4584,6 +4588,12 @@ class CulMaxCoordinator:
         """Mark older devices as superseded when a duplicate is paired again."""
         superseded: list[KnownDevice] = []
         normalized_new = new_address.upper()
+        current = self.get_device(normalized_new)
+        if current is not None:
+            # Reactivation and superseding peers are one synchronous transition.
+            # Even overlapping pairing finalizers must leave one active address.
+            current.superseded_by = ""
+            current.duplicate_reason = ""
         serial_matches = [
             device
             for device in self._find_devices_by_serial(serial_number)

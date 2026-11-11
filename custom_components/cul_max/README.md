@@ -1459,8 +1459,13 @@ duration: 60
 Bei mehreren CUL-Anschlüssen zuerst den gewünschten Anschluss auswählen. Mit
 **Pairing starten** das Zeitfenster öffnen und anschließend Pairing am Gerät
 aktivieren. Die Live-Liste zeigt angelernte Thermostate, Fensterkontakte und
-weitere MAX!-Geräte. **Gerät bearbeiten** öffnet die HA-Geräteseite für Name und
-Raum. Änderungen dort erscheinen automatisch in der Karte.
+weitere MAX!-Geräte. **Gerät bearbeiten** öffnet einen eigenen Dialog für Name
+und Raum über dem Dashboard. Er nutzt die gemeinsamen Karten-Styles und speichert
+nur geänderte Felder über die HA-Geräteverwaltung. Live-Updates erhalten laufende
+Eingaben; bei Speicherfehlern bleibt der Dialog mit den Eingaben offen. Abbrechen
+ändert nichts. Auf kleinen Displays bleibt der Formularbereich scrollbar und die
+Buttonleiste sichtbar. Ein aktueller Browser beziehungsweise Android System WebView
+wird vorausgesetzt; interne HA-Dialogfunktionen werden nicht benötigt.
 
 Die Liste bleibt nach Ablauf, Browser-Neuladen und Integration-Reload erhalten;
 ein neuer Pairing-Start ersetzt sie. Beim HA-Neustart wird sie verworfen.
@@ -1469,3 +1474,7 @@ Auch die bestehende Aktion `cul_max.start_pairing` aktualisiert die Liste.
 Die Karte ist für Administratoren vorgesehen. Optional fixiert `config_entry_id`
 einen CUL-Anschluss; `duration` erlaubt 1 bis 3600 Sekunden (Standard 60).
 Die Karte vergibt keine Namen oder Räume automatisch und erstellt keine Funklinks.
+
+Beim erneuten Pairing einer bekannten Funkadresse bleiben der gespeicherte
+Wochenplan, Temperaturparameter, Verknüpfungen und Zustandsdaten erhalten.
+Bereits zuvor überschriebene Profile werden dadurch nicht rekonstruiert.

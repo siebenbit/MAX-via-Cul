@@ -1054,10 +1054,18 @@ duration: 60
 
 Select a controller if several are loaded, start pairing, then activate pairing
 on the physical device. Live results include thermostats and window contacts.
-**Gerät bearbeiten** opens the HA device page to edit its name and area; registry
-changes appear automatically. Results survive navigation, browser refresh and
+**Gerät bearbeiten** opens a small name-and-area dialog over the dashboard,
+using the shared card styles and HA's device registry API. Only changed fields
+are saved. Live updates preserve input; failed saves keep the dialog open.
+Cancel makes no changes. On small screens the form scrolls while the action bar
+remains visible. A current browser or Android System WebView is required; no
+internal HA dialog functions are used. Registry changes appear automatically. Results survive navigation, browser refresh and
 integration reload until the next pairing start or HA restart. Reload ends an
 active window without restarting it. The existing `cul_max.start_pairing` action
 also updates the list. Administrator access is required. Optional `config_entry_id`
 fixes a controller; `duration` accepts 1–3600 seconds, default 60. Names, areas and
 RF peer links are not assigned automatically.
+
+Re-pairing a known radio address preserves its stored week profile, temperature
+parameters, links and state. Previously overwritten profiles cannot be recovered
+by this fix.

@@ -97,3 +97,101 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
                     await first
                 self.assertEqual(len(self.c.pairing_session.devices), 1)
                 self.assertEqual(self.c.pairing_session.devices["123456"]["already_known"], initially_known)
+
+    async def test_repair_preserves_device_object_profile_and_settings(self):
+        from dataclasses import asdict
+        device = transport.mod.KnownDevice("123456", 1, "Heizung Bad", paired=True,
+            serial_number="NEQ1234567", firmware_version="3", week_profile="stored-profile",
+            week_profile_known_days=[0, 2], group_id=7, linked_partners=["234567"],
+            comfort_temperature=23, eco_temperature=16, measurement_offset=1.5,
+            time_slot=4, last_state={"mode": 1, "desired_temperature": 22},
+            last_normal_target=22, acknowledged_state={"mode": 1}, pending_config=["Wochenplan"])
+        self.c._devices[device.address] = device
+        before = asdict(device)
+        await self.c.async_start_pairing(60)
+        self.c._ensure_time_slots_assigned = AsyncMock()
+        self.c._sync_device_registry_entry = AsyncMock()
+        self.c.async_send_time_information = AsyncMock()
+        await self.c._finalize_pair_ping(msg=None, src=device.address, device_type=1,
+            firmware=0, serial_str="", session_id=self.c.pairing_session.id)
+        self.assertIs(self.c.get_device(device.address), device)
+        after = asdict(device)
+        before.pop("last_seen")
+        after.pop("last_seen")
+        self.assertEqual(after, before)
+        self.assertTrue(device.last_seen)
+
+    async def test_repair_reactivates_replaced_address_and_persists_configuration(self):
+        import types
+        mod = transport.mod
+        for incoming_serial in ("NEQ1234567", ""):
+            with self.subTest(incoming_serial=incoming_serial):
+                a = mod.KnownDevice("123456", 1, "Heizung", paired=True,
+                    serial_number="NEQ1234567", superseded_by="234567",
+                    duplicate_reason="serial_number:NEQ1234567", week_profile="profile-a",
+                    week_profile_known_days=[0, 3], group_id=7, linked_partners=["345678"],
+                    acknowledged_state={"mode": 1})
+                b = mod.KnownDevice("234567", 1, "Heizung", paired=True,
+                    serial_number=a.serial_number, week_profile="profile-b")
+                other = mod.KnownDevice("345678", 1, "Heizung", paired=True,
+                    serial_number="OTHER12345", week_profile="profile-other")
+                self.c._devices = {d.address: d for d in (a, b, other)}
+                self.c._ensure_time_slots_assigned = AsyncMock()
+                self.c._sync_device_registry_entry = AsyncMock()
+                self.c.async_send_time_information = AsyncMock()
+                await self.c.async_start_pairing(60)
+                for address in (a.address, b.address, a.address):
+                    await self.c._finalize_pair_ping(msg=None, src=address, device_type=1,
+                        firmware=0, serial_str=incoming_serial, session_id=self.c.pairing_session.id)
+                    current = self.c.get_device(address)
+                    self.assertEqual(current.superseded_by, "")
+                    self.assertEqual(current.duplicate_reason, "")
+                    self.assertEqual([d.address for d in self.c.get_superseded_devices()],
+                                     [b.address if address == a.address else a.address])
+                self.assertIs(self.c.get_device(a.address), a)
+                self.assertEqual((a.week_profile, a.week_profile_known_days, a.group_id,
+                                  a.linked_partners, a.acknowledged_state),
+                                 ("profile-a", [0, 3], 7, ["345678"], {"mode": 1}))
+                self.assertEqual(b.week_profile, "profile-b")
+                self.assertEqual(other.superseded_by, "")
+                self.c._store = types.SimpleNamespace(async_save=AsyncMock())
+                await mod.CulMaxCoordinator._save_devices(self.c)
+                saved = self.c._store.async_save.call_args.args[0]["devices"]
+                self.assertEqual(saved[a.address]["superseded_by"], "")
+                self.assertEqual(saved[b.address]["superseded_by"], a.address)
+                self.assertEqual(saved[a.address]["week_profile"], "profile-a")
+
+    async def test_overlapping_repair_finalizers_do_not_create_replacement_cycle(self):
+        mod = transport.mod
+        a = mod.KnownDevice("123456", 1, "A", paired=True, serial_number="NEQ1234567",
+                            superseded_by="234567", duplicate_reason="old")
+        b = mod.KnownDevice("234567", 1, "B", paired=True, serial_number=a.serial_number)
+        self.c._devices = {a.address: a, b.address: b}
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        calls = 0
+        async def ensure():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await gate.wait()
+        self.c._ensure_time_slots_assigned = ensure
+        self.c._sync_device_registry_entry = AsyncMock()
+        self.c.async_send_time_information = AsyncMock()
+        await self.c.async_start_pairing(60)
+        async def pair(address):
+            await self.c._finalize_pair_ping(msg=None, src=address, device_type=1,
+                firmware=0, serial_str=a.serial_number, session_id=self.c.pairing_session.id)
+        first = asyncio.create_task(pair(a.address))
+        try:
+            await asyncio.wait_for(entered.wait(), .5)
+            await pair(b.address)
+            self.assertEqual(b.superseded_by, "")
+            self.assertEqual(a.superseded_by, b.address)
+        finally:
+            gate.set()
+            await first
+        self.assertEqual(a.superseded_by, "")
+        self.assertEqual(a.duplicate_reason, "")
+        self.assertEqual(b.superseded_by, a.address)
