@@ -948,6 +948,12 @@ Changing rooms prompts before losing edits. A reconnect retains the draft; a ful
 browser reload loses local drafts after the normal browser warning. Accepted
 operations remain in durable storage.
 
+New weekly schedule jobs start with today in Home Assistant's configured time
+zone, followed by the coming days. Room saves skip unchanged, confirmed days.
+Each day's packet parts stay together and are acknowledged sequentially. Both
+the room card and the legacy weekly schedule actions determine this order when
+enqueueing; retries and restarts preserve it. Existing queued work is not reordered.
+
 The four combined temperature parameters lock together while pending, and the
 whole weekly schedule is a second lock block. Other rooms and free blocks remain
 editable. Legacy actions and entities enforce the same locks in the backend.

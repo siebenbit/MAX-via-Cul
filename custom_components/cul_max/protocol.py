@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
@@ -95,6 +96,12 @@ def format_display_temperature(temp: float) -> str:
 def local_datetime_to_max_day(when: datetime) -> int:
     """Convert Python weekday numbering to MAX! internal Saturday-first numbering."""
     return (when.weekday() + 2) % 7
+
+
+def order_week_profile_days(days: Iterable[int], when: datetime) -> list[int]:
+    """Order MAX! weekdays from the supplied local day through the following week."""
+    today = local_datetime_to_max_day(when)
+    return sorted(days, key=lambda day: (day - today) % 7)
 
 
 @dataclass

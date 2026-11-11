@@ -1328,6 +1328,14 @@ Entwurf. Ein vollständiges Neuladen der Browserseite verwirft lokale Entwürfe
 (nach dem üblichen Browserhinweis). Akzeptierte Aufträge bleiben gespeichert.
 Kopieren der gesamten Konfiguration auf andere Räume ist noch nicht enthalten.
 
+Neue Wochenprofilaufträge beginnen mit dem aktuellen Tag in der konfigurierten
+Home-Assistant-Zeitzone; danach folgen die kommenden Tage. Bereits bestätigte,
+unveränderte Tage werden beim Speichern über die Raumkarte übersprungen.
+Die Teilpakete eines Tages bleiben zusammen und werden nacheinander bestätigt.
+Die Reihenfolge wird beim Einreihen festgelegt und bleibt bei Wiederholungen und
+nach einem Neustart erhalten. Das gilt für die Raumkarte und die bisherigen
+Wochenprofilaktionen. Bereits eingereihte Aufträge werden nicht umsortiert.
+
 ### Sperren, Konflikte und Teilübertragung
 
 Die vier Temperaturparameter werden zusammen in einem Funkpaket übertragen und

@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import importlib
 import sys
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import test_credit as transport
 
 mod, protocol = transport.mod, transport.protocol
-room_module = importlib.import_module("_cul_budget_tests.room_config")
+with patch.dict(sys.modules, {"homeassistant.util": types.SimpleNamespace(dt=mod.dt_util)}):
+    room_module = importlib.import_module("_cul_budget_tests.room_config")
+sys.modules[room_module.__name__] = room_module
 
 
 class RoomConfigTests(unittest.IsolatedAsyncioTestCase):
@@ -61,6 +65,52 @@ class RoomConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(calls), {"123456", "234567"})
         self.assertTrue(self.c._pending_climate_config["234567"][0].admitted)
         self.assertEqual(sum(map(len, self.c._pending_climate_config.values())), 2)
+
+    async def test_room_profile_orders_days_today_first_and_keeps_parts_together(self):
+        profile = "17,03:00,18,06:00,19,09:00,20,12:00,21,15:00,22,18:00,23,21:00,24"
+        today = datetime(2026, 11, 11, 12, tzinfo=ZoneInfo("Europe/Berlin"))
+        with patch.object(room_module.dt_util, "now", return_value=today) as clock:
+            await self.save({"week_profile": {day: profile for day in room_module.DAY_LABELS}})
+        clock.assert_called_once()
+        expected = [(day, part) for day in [4, 5, 6, 0, 1, 2, 3] for part in [0, 1]]
+        for commands in self.c._pending_climate_config.values():
+            self.assertEqual([(command.day, command.part) for command in commands], expected)
+
+    async def test_room_profile_skips_unchanged_days_and_uses_ha_local_date(self):
+        today = datetime(2026, 11, 16, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+        unchanged = protocol.format_week_profile_by_day(self.c.get_device("123456").week_profile)["tuesday"]
+        with patch.object(room_module.dt_util, "now", return_value=today):
+            await self.save({"week_profile": {"sunday": "20", "monday": "20", "tuesday": unchanged}})
+        for commands in self.c._pending_climate_config.values():
+            self.assertEqual([command.day for command in commands], [2, 1])
+
+    async def test_legacy_profile_service_also_uses_today_first(self):
+        self.c._process_climate_config_queue = AsyncMock()
+        today = datetime(2026, 11, 13, 12, tzinfo=ZoneInfo("Europe/Berlin"))
+        with patch.object(mod.dt_util, "now", return_value=today):
+            await self.c.async_set_week_profile("123456", "Sat 20\nFri 20\nSun 20")
+        self.assertEqual([command.day for command in self.c._pending_climate_config["123456"]], [6, 0, 1])
+
+    async def test_restored_and_replayed_profile_preserves_original_day_order(self):
+        today = datetime(2026, 11, 11, 12, tzinfo=ZoneInfo("Europe/Berlin"))
+        revision = self.room()["revision"]
+        changes = {"week_profile": {day: "20" for day in room_module.DAY_LABELS}}
+        with patch.object(room_module.dt_util, "now", return_value=today):
+            await self.save(changes, revision=revision)
+        original = [command.day for command in self.c._pending_climate_config["123456"]]
+        # Replay on the following day must reuse the already admitted work.
+        with patch.object(room_module.dt_util, "now", return_value=today.replace(day=12)):
+            await self.save(changes, revision=revision)
+        self.assertEqual([command.day for command in self.c._pending_climate_config["123456"]], original)
+        self.c._store = types.SimpleNamespace(async_save=AsyncMock())
+        await mod.CulMaxCoordinator._save_devices(self.c)
+        saved = self.c._store.async_save.call_args.args[0]
+        restored = mod.CulMaxCoordinator(types.SimpleNamespace(loop=self.clock), "simulated")
+        restored._store = types.SimpleNamespace(async_load=AsyncMock(return_value=saved), async_save=AsyncMock())
+        restored._sync_device_registry_entry = AsyncMock()
+        with patch.object(mod.dt_util, "now", return_value=today.replace(day=12)):
+            await restored._load_devices()
+        self.assertEqual([command.day for command in restored._pending_climate_config["123456"]], original)
 
     async def test_room_snapshot_aggregates_mixed_values_without_selecting_a_device(self):
         self.c.get_device("234567").eco_temperature = 18

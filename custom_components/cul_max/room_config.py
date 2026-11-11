@@ -7,8 +7,10 @@ import hashlib
 import json
 from uuid import uuid4
 
+from homeassistant.util import dt as dt_util
+
 from .const import CLIMATE_DEVICE_TYPES, DOMAIN
-from .protocol import (encode_week_profile, format_week_profile_by_day, parse_max_temperature,
+from .protocol import (encode_week_profile, format_week_profile_by_day, order_week_profile_days, parse_max_temperature,
                        parse_week_profile_text, split_week_profile_for_send)
 
 TEMPERATURE_KEYS = ("comfort_temperature", "eco_temperature", "window_open_temperature", "window_open_duration")
@@ -189,6 +191,8 @@ class RoomConfigManager:
                 if expected_revision.get(block) != room["revision"][block]:
                     raise ValueError("Konfiguration wurde zwischenzeitlich geändert. Bitte neu laden.")
             plans = []
+            # Freeze the HA-local admission date for all devices in this save.
+            send_time = dt_util.now()
             for item in room["devices"]:
                 c = self.controllers[item["config_entry_id"]]
                 address = item["address"]
@@ -224,7 +228,8 @@ class RoomConfigManager:
                     commands = [PendingClimateCommand("config_week_profile", f"ConfigWeekProfile {device.name} {day} / {part}",
                                 day=day, part=part, chunk_hex=chunk, profile_hex=target,
                                 job_id=job_id, admitted=False)
-                                for day in sorted(updates) for part, chunk in split_week_profile_for_send(target, day)]
+                                for day in order_week_profile_days(updates, send_time)
+                                for part, chunk in split_week_profile_for_send(target, day)]
                     plans.append((c, address, "week_profile", commands))
             # No await between reservations. Workers cannot consume uncommitted commands.
             for c, address, block, commands in plans:

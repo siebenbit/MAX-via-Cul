@@ -67,10 +67,31 @@ get_expected_week_profile_temperature = protocol.get_expected_week_profile_tempe
 parse_week_profile_text = protocol.parse_week_profile_text
 parse_week_profile_time = protocol.parse_week_profile_time
 split_week_profile_for_send = protocol.split_week_profile_for_send
+order_week_profile_days = protocol.order_week_profile_days
 
 
 class WeekProfileEncodingTests(unittest.TestCase):
     """Byte-accurate regression tests against the FHEM-compatible profile format."""
+
+    def test_send_order_starts_today_and_wraps_to_the_next_week(self) -> None:
+        for date, expected in (
+            (11, [4, 5, 6, 0, 1, 2, 3]),  # Wednesday
+            (13, [6, 0, 1, 2, 3, 4, 5]),  # Friday: MAX! numbering wraps here.
+            (15, [1, 2, 3, 4, 5, 6, 0]),  # Sunday: calendar week wraps here.
+        ):
+            with self.subTest(date=date):
+                self.assertEqual(order_week_profile_days(range(7), datetime(2026, 11, date)), expected)
+
+    def test_send_order_preserves_only_requested_days(self) -> None:
+        when = datetime(2026, 11, 11)
+        self.assertEqual(order_week_profile_days([0, 2, 5], when), [5, 0, 2])
+        self.assertEqual(order_week_profile_days([], when), [])
+
+    def test_send_order_uses_supplied_timezone_at_midnight(self) -> None:
+        when = datetime(2026, 11, 16, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+        self.assertEqual(order_week_profile_days(range(7), when), [2, 3, 4, 5, 6, 0, 1])
+        self.assertEqual(order_week_profile_days(range(7), when.astimezone(ZoneInfo("UTC"))),
+                         [1, 2, 3, 4, 5, 6, 0])
 
     def test_parse_week_profile_time_accepts_2400(self) -> None:
         self.assertEqual(parse_week_profile_time("24:00"), 24 * 60)

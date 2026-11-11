@@ -78,6 +78,7 @@ from .protocol import (
     format_week_profile_lines,
     get_expected_week_profile_temperature,
     normalize_week_profile_hex,
+    order_week_profile_days,
     parse_time_information_payload,
     parse_week_profile_text,
     parse_max_temperature,
@@ -3710,7 +3711,7 @@ class CulMaxCoordinator:
         updates = parse_week_profile_text(profile_text)
         merged_profile = encode_week_profile(updates, self.get_local_week_profile(address))
         pending_commands: list[PendingClimateCommand] = []
-        for day in sorted(updates):
+        for day in order_week_profile_days(updates, dt_util.now()):
             for part, chunk_hex in split_week_profile_for_send(merged_profile, day):
                 pending_commands.append(
                     PendingClimateCommand(

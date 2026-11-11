@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import importlib.util
 from pathlib import Path
 import sys
@@ -28,6 +29,7 @@ def load_coordinator():
     stubs["homeassistant.core"].HomeAssistant = object
     stubs["homeassistant.core"].callback = lambda f: f
     stubs["homeassistant.helpers.storage"].Store = lambda *args: object()
+    stubs["homeassistant.util.dt"].now = lambda: datetime.now().astimezone()
     loaded = {}
     with patch.dict(sys.modules, stubs):
         for name in ("const", "protocol", "coordinator"):
