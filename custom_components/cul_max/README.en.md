@@ -930,13 +930,17 @@ and the other cards remain available; no dashboard is modified automatically.
 
 Edits remain drafts until **Save**. One Save admits all changed values for the
 selected room. Mixed device values are shown as mixed; no reference device is
-silently chosen. Select a device's day explicitly as a template or create a new
-one. The stepped graph updates as rows are edited. Time is always 24-hour format;
-`0630` becomes `06:30`. A day starts at 00:00 and ends at 24:00, using five-minute
-times, half-degree temperatures and at most 13 sections. **Tag auf alle Tage
-kopieren** copies the selected day to seven independent drafts after confirmation.
+silently chosen. Create a new common day profile when device profiles differ. The stepped graph
+updates as rows are edited. Native time fields use the browser's time picker and locale. A day starts at 00:00 and ends at 24:00, using five-minute
+times, half-degree temperatures and at most 13 sections. **Tag auf andere Tage kopieren …** opens a target-day selection excluding the source day.
+Select individual days or use Select all / Clear selection, then apply to the selected
+days. Other drafts remain unchanged. A visible dot immediately marks unsaved day
+changes and disappears when the original profile is restored.
 Nothing is transmitted until Save. Copying whole configurations to other rooms
 is not included yet.
+
+The ⓘ buttons beside the temperature parameters explain their meaning. Help is
+available on hover, keyboard focus, or tap.
 
 **Discard** affects unsaved edits only. Existing drafts from the legacy device
 entities can also be discarded after confirmation; queued work is never removed.
@@ -953,7 +957,7 @@ same operation ID does not enqueue the same work twice.
 
 Queued is not confirmed. The device progress section shows ACK counts, live
 status and errors. A schedule day is confirmed only after its required parts are
-acknowledged; partial days are not offered as complete templates. Cancelling a
+acknowledged; partial days are not treated as confirmed profiles. Cancelling a
 configuration job waits for its active radio packet to finish, and never undoes
 already confirmed steps. Existing queue persistence resumes work after restart.
 There is no full device configuration readback: confirmation means an acknowledged

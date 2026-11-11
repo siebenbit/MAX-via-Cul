@@ -1304,17 +1304,21 @@ Eingaben ändern zunächst nur den Entwurf. **Speichern** übernimmt alle geänd
 Werte gemeinsam für sämtliche Thermostate des gewählten Raums. Nicht geänderte
 Blöcke und bereits bestätigte identische Werte erzeugen keine neuen Funkaufträge.
 Bei unterschiedlichen Ausgangswerten erscheint **Gemischt**; es wird kein Gerät
-still als Vorlage verwendet. Ein Tagesprofil kann ausdrücklich von einem der
-Raumgeräte übernommen oder neu angelegt werden.
+still als Vorlage verwendet. Bei unterschiedlichen Tagesprofilen kann ein neuer gemeinsamer Tagesplan angelegt werden.
+
+Die ⓘ-Schaltflächen an den Temperaturparametern erklären deren Bedeutung. Die Hilfen
+sind per Mauszeiger, Tastatur oder Antippen erreichbar.
 
 Der Wochenplan verwendet eine Stufenkurve und präzise Eingabezeilen:
 
 - Der erste Abschnitt beginnt fest um 00:00; der letzte reicht bis 24:00.
-- Uhrzeiten werden im 24-Stunden-Format eingegeben (`0630` wird zu `06:30`).
+- Native Zeitfelder bieten die Zeitauswahl des Browsers; deren Darstellung richtet sich nach Browser und Betriebssystem.
 - MAX! erlaubt fünf Minuten Zeitraster, halbe Temperaturgrade und höchstens
   13 Temperaturabschnitte pro Tag.
-- **Tag auf alle Tage kopieren** ersetzt nach Bestätigung die sieben Tagesentwürfe.
+- **Tag auf andere Tage kopieren …** öffnet die Auswahl der Zieltage. Der aktuelle Tag ist die Quelle.
+  **Alle auswählen** und **Auswahl aufheben** erleichtern die Auswahl; **Auf N Tage übernehmen** ersetzt nur die gewählten Tagesentwürfe.
   Erst Speichern startet die Übertragung.
+- Ein deutlich sichtbarer Punkt markiert ungespeicherte Tagesänderungen sofort. Wird der Ausgangswert wiederhergestellt, verschwindet die Markierung.
 
 **Verwerfen** verwirft ausschließlich ungespeicherte Änderungen. Vorhandene
 Entwürfe aus den bisherigen Geräte-Entitäten können nach Rückfrage ebenfalls

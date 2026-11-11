@@ -1,22 +1,22 @@
 /* Room configuration uses only the documented cul_max actions and subscription. */
 const ROOM_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 const ROOM_DAY_LABELS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
+const ROOM_DAY_NAMES = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"];
 const ROOM_FIELDS = {
   comfort_temperature: ["Komforttemperatur", 4.5, 30.5, 0.5, "°C"],
   eco_temperature: ["Ecotemperatur", 4.5, 30.5, 0.5, "°C"],
   window_open_temperature: ["Fenster-offen-Temperatur", 4.5, 30.5, 0.5, "°C"],
   window_open_duration: ["Fenster-offen-Dauer", 0, 60, 5, "min"],
 };
+const ROOM_FIELD_HELP = {
+  comfort_temperature: "Deine Wohlfühltemperatur. Wird beim Umschalten auf Komfort am Thermostat verwendet. Die Temperaturen im Wochenplan bleiben unverändert.",
+  eco_temperature: "Deine Temperatur zum Energiesparen, zum Beispiel nachts oder bei Abwesenheit. Wird beim Umschalten auf Eco am Thermostat verwendet. Die Temperaturen im Wochenplan bleiben unverändert.",
+  window_open_temperature: "Auf diese Temperatur wird beim Lüften abgesenkt. Ausgelöst durch die automatische Erkennung oder einen verknüpften Fensterkontakt.",
+  window_open_duration: "So lange bleibt die Temperatur bei automatisch erkanntem Lüften abgesenkt. Mit Fensterkontakt richtet sich die Absenkung nach dem Öffnen und Schließen des Fensters.",
+};
 const roomEscape = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const roomNumber = (value) => new Intl.NumberFormat("de-DE", { maximumFractionDigits: 1 }).format(value);
 const roomMinutes = (time) => /^\d\d:\d\d$/.test(time) ? Number(time.slice(0, 2)) * 60 + Number(time.slice(3)) : NaN;
-const normalizeRoomTime = (value) => {
-  const text = value.trim();
-  if (/^\d{1,2}$/.test(text)) return `${text.padStart(2, "0")}:00`;
-  if (/^\d{3,4}$/.test(text)) { const padded = text.padStart(4, "0"); return `${padded.slice(0, 2)}:${padded.slice(2)}`; }
-  if (/^\d:\d\d$/.test(text)) return `0${text}`;
-  return text;
-};
 const roomTime = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 const cloneRoomValue = (value) => JSON.parse(JSON.stringify(value));
 
@@ -74,6 +74,8 @@ class CulMaxRoomConfigCard extends HTMLElement {
     this._changes = {};
     this._baseRevision = {};
     this._day = "monday";
+    this._copyOpen = false;
+    this._copyTargets = new Set();
     this._epoch = 0;
     this._version = 0;
     this._online = false;
@@ -181,9 +183,27 @@ class CulMaxRoomConfigCard extends HTMLElement {
     this._updatePreview();
   }
   _editRows(rows) {
-    this._changes.week_profile = { ...(this._changes.week_profile || {}), [this._day]: rows };
+    this._setDayRows(this._day, rows);
     this._version++; this._pendingOperation = null;
     this._updatePreview();
+  }
+  _setDayRows(day, rows) {
+    const baseline = CulMaxRoomProfile.parse(this._room()?.values.week_profile[day]);
+    const unchanged = baseline && !CulMaxRoomProfile.validate(baseline) && !CulMaxRoomProfile.validate(rows) &&
+      CulMaxRoomProfile.serialize(rows) === CulMaxRoomProfile.serialize(baseline);
+    const days = { ...(this._changes.week_profile || {}) };
+    if (unchanged) delete days[day];
+    else days[day] = cloneRoomValue(rows);
+    if (Object.keys(days).length) this._changes.week_profile = days;
+    else delete this._changes.week_profile;
+  }
+  _dayLabel(day) {
+    const index = ROOM_DAYS.indexOf(day);
+    return `${ROOM_DAY_NAMES[index]}${this._changes.week_profile?.[day] ? ", ungespeicherte Änderungen" : ""}`;
+  }
+  _dayContent(day) {
+    const index = ROOM_DAYS.indexOf(day);
+    return `${ROOM_DAY_LABELS[index]}${this._changes.week_profile?.[day] ? '<span class="dirty-dot" aria-hidden="true"></span>' : ""}`;
   }
   _errors() {
     const errors = [];
@@ -222,14 +242,22 @@ class CulMaxRoomConfigCard extends HTMLElement {
     if (add) add.disabled = this._locked("week_profile") || (this._rows()?.length || 0) >= 13 || !!CulMaxRoomProfile.validate(this._rows());
     const copy = this.shadowRoot.querySelector("[data-copy]");
     if (copy) copy.disabled = this._locked("week_profile") || !!CulMaxRoomProfile.validate(this._rows());
+    this.shadowRoot.querySelectorAll("[data-day]").forEach((button) => {
+      button.innerHTML = this._dayContent(button.dataset.day);
+      button.setAttribute("aria-label", this._dayLabel(button.dataset.day));
+    });
+    const apply = this.shadowRoot.querySelector("[data-copy-apply]");
+    if (apply) apply.disabled = !this._copyTargets.size || this._locked("week_profile") || !!CulMaxRoomProfile.validate(this._rows());
   }
   _selectRoom(area) {
     if (area !== this._area && this._dirty() && !window.confirm("Ungespeicherte Änderungen verwerfen und den Raum wechseln?")) { this._render(); return; }
     this._area = area; this._changes = {}; this._baseRevision = {}; this._conflict = false; this._error = ""; this._message = ""; this._pendingOperation = null;
+    this._copyOpen = false; this._copyTargets.clear();
     this._receive({ rooms: this._rooms });
   }
   async _save() {
     if (!this._canSave()) return;
+    this._copyOpen = false; this._copyTargets.clear();
     const changes = {};
     for (const [key, value] of Object.entries(this._changes)) changes[key] = key === "week_profile"
       ? Object.fromEntries(Object.entries(value).map(([day, rows]) => [day, CulMaxRoomProfile.serialize(rows)])) : Number(value);
@@ -254,6 +282,7 @@ class CulMaxRoomConfigCard extends HTMLElement {
       catch (error) { this._error = error.message || String(error); this._render(); return; }
     }
     this._changes = {}; this._baseRevision = {}; this._conflict = false; this._pendingOperation = null; this._error = "";
+    this._copyOpen = false; this._copyTargets.clear();
     this._receive({ rooms: this._rooms });
     await this._load();
   }
@@ -269,11 +298,23 @@ class CulMaxRoomConfigCard extends HTMLElement {
     this._editRows(rows); this._render();
   }
   _copyDay() {
-    if (this._locked("week_profile") || CulMaxRoomProfile.validate(this._rows())) return;
-    if (!window.confirm("Diesen Tagesplan auf alle sieben Tage im Entwurf übertragen? Vorhandene Tagesentwürfe werden ersetzt. Erst Speichern sendet die Änderungen.")) return;
+    if (this._locked("week_profile") || CulMaxRoomProfile.validate(this._rows()) || !this._copyTargets.size) return;
     const rows = this._rows();
-    this._changes.week_profile = Object.fromEntries(ROOM_DAYS.map((day) => [day, cloneRoomValue(rows)]));
+    for (const day of this._copyTargets) if (ROOM_DAYS.includes(day) && day !== this._day) this._setDayRows(day, rows);
+    this._copyOpen = false; this._copyTargets.clear();
     this._version++; this._pendingOperation = null; this._render();
+  }
+  _copyPanel(disabled) {
+    if (!this._copyOpen) return "";
+    const name = ROOM_DAY_NAMES[ROOM_DAYS.indexOf(this._day)];
+    return `<fieldset class="copy-panel" ${disabled}><legend>${name}sprofil kopieren auf:</legend>
+      <div class="copy-days">${ROOM_DAYS.filter((day) => day !== this._day).map((day) => {
+        const index = ROOM_DAYS.indexOf(day);
+        return `<label><input type="checkbox" data-copy-target="${day}" aria-label="${ROOM_DAY_NAMES[index]}" ${this._copyTargets.has(day) ? "checked" : ""}>${ROOM_DAY_LABELS[index]}</label>`;
+      }).join("")}</div>
+      <div class="copy-tools"><button class="compact" data-copy-all>Alle auswählen</button><button class="compact" data-copy-none>Auswahl aufheben</button></div>
+      <p>Ersetzt die Tagespläne der ausgewählten Tage im Entwurf. Erst Speichern überträgt die Änderungen.</p>
+      <div class="copy-actions"><button data-copy-cancel>Abbrechen</button><button data-copy-apply ${!this._copyTargets.size || CulMaxRoomProfile.validate(this._rows()) ? "disabled" : ""}>Auf ${this._copyTargets.size} ${this._copyTargets.size === 1 ? "Tag" : "Tage"} übernehmen</button></div></fieldset>`;
   }
   async _cancel(job, owner) {
     if (!window.confirm("Gesamten Konfigurationsauftrag abbrechen? Bereits bestätigte Teile bleiben übertragen; eine laufende Übertragung wird zuerst abgeschlossen.")) return;
@@ -287,6 +328,15 @@ class CulMaxRoomConfigCard extends HTMLElement {
       const jobs = [...active, ...device.jobs.filter((j) => !active.includes(j)).slice(-2)];
       return `<div class="device"><strong>${roomEscape(device.name)}</strong>${!device.paired ? '<div class="error">Noch nicht gepairt · Speichern nicht möglich</div>' : ""}${jobs.map((job) => `<div class="job"><span>${roomEscape(job.block === "temperature" ? "Temperaturparameter" : "Wochenplan")} · ${roomEscape(labels[job.status] || job.status)}<small>${job.confirmed_steps.length} / ${job.steps.length} Pakete bestätigt${job.last_error ? ` · ${roomEscape(job.last_error)} · erneuter Versuch ausstehend` : ""}</small></span>${!job.direct && !['completed', 'cancelled', 'failed'].includes(job.status) ? `<button data-cancel="${roomEscape(job.id)}" data-owner="${roomEscape(device.config_entry_id)}" class="compact">Abbrechen</button>` : ""}</div>`).join("") || '<small>Kein ausstehender Konfigurationsauftrag</small>'}</div>`;
     }).join("");
+  }
+  _showFieldHelp(key, pinned = false) {
+    this._helpOpen = key;
+    this._helpPinned = pinned;
+    this.shadowRoot.querySelectorAll("[data-help]").forEach((field) => {
+      const open = field.dataset.help === key;
+      field.querySelector("[role=tooltip]").hidden = !open;
+      field.querySelector("[data-help-button]").setAttribute("aria-expanded", String(open));
+    });
   }
   _render() {
     if (!this.shadowRoot || !this._config) return;
@@ -304,35 +354,53 @@ class CulMaxRoomConfigCard extends HTMLElement {
       ${this._error ? `<div class="error" role="alert">${roomEscape(this._error)}</div>` : ""}
       ${this._message ? `<div class="notice" role="status">${roomEscape(this._message)}</div>` : ""}
       ${this._conflict ? '<div class="error">Die Konfiguration wurde zwischenzeitlich geändert. Dein Entwurf bleibt erhalten. Bitte Änderungen verwerfen und den aktuellen Stand neu laden.</div>' : ""}
-      ${room ? `<p class="subtitle">Gespeicherte Konfiguration für ${room.devices.length} Thermostat${room.devices.length === 1 ? "" : "e"} · Änderungen werden erst mit Speichern eingereiht.</p>
-      <section><h3>Temperaturparameter ${room.locks.temperature ? '<span class="status">Übertragung läuft · gesperrt</span>' : ""}</h3><div class="fields">${Object.entries(ROOM_FIELDS).map(([key, [label, min, max, step, unit]]) => `<label>${label}<div class="input-unit"><input data-focus="${key}" data-key="${key}" aria-label="${label}" type="number" min="${min}" max="${max}" step="${step}" value="${roomEscape(this._changes[key] ?? room.values[key])}" placeholder="${room.mixed.includes(key) ? "Gemischt" : "Unbekannt"}" ${disabledTemp}><span>${unit}</span></div></label>`).join("")}</div></section>
-      <section><h3>Wochenplan ${room.locks.week_profile ? '<span class="status">Übertragung läuft · gesperrt</span>' : ""}</h3><div class="days" role="tablist">${ROOM_DAYS.map((day, i) => `<button role="tab" aria-selected="${day === this._day}" data-day="${day}" class="${day === this._day ? "selected" : ""}">${ROOM_DAY_LABELS[i]}${this._changes.week_profile?.[day] ? " ·" : ""}</button>`).join("")}</div>
-      <div data-graph>${rows ? CulMaxRoomProfile.graph(rows, (this.clientWidth || 760) < 480) : '<div class="empty">Kein gemeinsames Tagesprofil. Vorlage wählen oder einen neuen Tagesplan anlegen.</div>'}</div>
+      ${room ? `
+      <section><h3>Temperaturparameter ${room.locks.temperature ? '<span class="status">Übertragung läuft · gesperrt</span>' : ""}</h3><div class="fields">${Object.entries(ROOM_FIELDS).map(([key, [label, min, max, step, unit]]) => `<div class="field" data-help="${key}"><div class="field-label"><label for="field-${key}">${label}</label><button class="help-button" data-help-button aria-label="Hilfe zu ${label}" aria-controls="help-${key}" aria-describedby="help-${key}" aria-expanded="false">ⓘ</button></div><div class="field-tooltip" id="help-${key}" role="tooltip" hidden>${roomEscape(ROOM_FIELD_HELP[key])}</div><div class="input-unit"><input id="field-${key}" data-focus="${key}" data-key="${key}" aria-label="${label}" aria-describedby="help-${key}" type="number" min="${min}" max="${max}" step="${step}" value="${roomEscape(this._changes[key] ?? room.values[key])}" placeholder="${room.mixed.includes(key) ? "Gemischt" : "Unbekannt"}" ${disabledTemp}><span>${unit}</span></div></div>`).join("")}</div></section>
+      <section><h3>Wochenplan ${room.locks.week_profile ? '<span class="status">Übertragung läuft · gesperrt</span>' : ""}</h3><div class="days" role="tablist">${ROOM_DAYS.map((day) => `<button role="tab" aria-selected="${day === this._day}" aria-label="${this._dayLabel(day)}" data-day="${day}" class="${day === this._day ? "selected" : ""}">${this._dayContent(day)}</button>`).join("")}</div>
+      <div data-graph>${rows ? CulMaxRoomProfile.graph(rows, (this.clientWidth || 760) < 480) : '<div class="empty">Kein gemeinsames Tagesprofil. Bitte einen neuen Tagesplan anlegen.</div>'}</div>
       <div class="row-heading"><h4>Schaltzeiten</h4><span>Ab Uhrzeit → Temperatur</span></div>
-      ${rows ? rows.map((row, index) => `<div class="switch-row"><input data-focus="time-${index}" aria-label="Schaltzeit ${index + 1}" data-index="${index}" data-part="time" type="text" inputmode="numeric" maxlength="5" placeholder="HH:MM" title="24-Stunden-Format, z. B. 06:30 oder 0630" value="${roomEscape(row.time)}" ${index === 0 ? "disabled" : disabledWeek}><span aria-hidden="true">→</span><input data-focus="temperature-${index}" aria-label="Temperatur Abschnitt ${index + 1}" data-index="${index}" data-part="temperature" type="number" min="4.5" max="30.5" step="0.5" value="${roomEscape(row.temperature)}" ${disabledWeek}><span>°C</span><button data-remove="${index}" aria-label="Schaltzeit ${index + 1} löschen" title="Schaltzeit löschen" class="icon" ${!index ? "disabled" : disabledWeek}>${CulMaxRoomConfigCard.trash}</button></div>`).join("") : `<button data-new ${disabledWeek}>Neuen Tagesplan anlegen</button>`}
-      ${rows ? `<button class="wide" data-add ${disabledWeek || (rows.length >= 13 || CulMaxRoomProfile.validate(rows) ? "disabled" : "")}>＋ Schaltzeit hinzufügen</button><button class="wide" data-copy ${disabledWeek || (CulMaxRoomProfile.validate(rows) ? "disabled" : "")}>Tag auf alle Tage kopieren</button>` : ""}
-      <label class="template">Tagesprofil von einem Raumgerät übernehmen<select data-template ${disabledWeek}><option value="">Vorlage auswählen …</option>${room.devices.map((d, i) => `<option value="${i}" ${!d.confirmed.week_profile[this._day] ? "disabled" : ""}>${roomEscape(d.name)}</option>`).join("")}</select></label></section>
+      ${rows ? rows.map((row, index) => `<div class="switch-row"><input data-focus="time-${index}" aria-label="Schaltzeit ${index + 1}" data-index="${index}" data-part="time" type="time" min="00:00" max="23:55" step="300" required value="${roomEscape(row.time)}" ${index === 0 ? "disabled" : disabledWeek}><span aria-hidden="true">→</span><input data-focus="temperature-${index}" aria-label="Temperatur Abschnitt ${index + 1}" data-index="${index}" data-part="temperature" type="number" min="4.5" max="30.5" step="0.5" value="${roomEscape(row.temperature)}" ${disabledWeek}><span>°C</span><button data-remove="${index}" aria-label="Schaltzeit ${index + 1} löschen" title="Schaltzeit löschen" class="icon" ${!index ? "disabled" : disabledWeek}>${CulMaxRoomConfigCard.trash}</button></div>`).join("") : `<button data-new ${disabledWeek}>Neuen Tagesplan anlegen</button>`}
+      ${rows ? `<button class="wide" data-add ${disabledWeek || (rows.length >= 13 || CulMaxRoomProfile.validate(rows) ? "disabled" : "")}>＋ Schaltzeit hinzufügen</button><button class="wide" data-copy ${disabledWeek || (CulMaxRoomProfile.validate(rows) ? "disabled" : "")} aria-expanded="${!!this._copyOpen}">Tag auf andere Tage kopieren …</button>` : ""}
+      ${this._copyPanel(disabledWeek)}</section>
       <div class="error" data-errors role="alert">${roomEscape(this._errors().join(" "))}</div>
       <div class="actions"><button data-discard ${!this._dirty() || this._saving ? "disabled" : ""}>Verwerfen</button><button class="primary" data-save ${this._canSave() ? "" : "disabled"}>${this._saving ? "Wird eingereiht …" : "Speichern"}</button></div>
       <details ${room.devices.some((d) => d.jobs.length) ? "open" : ""}><summary>Geräte und Übertragungsfortschritt</summary>${this._progress(room)}</details>`
         : '<div class="empty">Keine MAX!-Thermostate in einem HA-Bereich gefunden. Ordne die Geräte in Home Assistant einem Bereich zu.</div>'}</ha-card>`;
     const query = (s) => this.shadowRoot.querySelector(s);
+    this._helpOpen = null; this._helpPinned = false;
+    this.shadowRoot.onclick = (event) => { if (!event.target.closest("[data-help]")) this._showFieldHelp(null); };
+    this.shadowRoot.querySelectorAll("[data-help]").forEach((field) => {
+      const button = field.querySelector("[data-help-button]");
+      const key = field.dataset.help;
+      button.addEventListener("mouseenter", () => { if (!this._helpPinned) this._showFieldHelp(key); });
+      field.addEventListener("mouseleave", () => { if (!this._helpPinned && this.shadowRoot.activeElement !== button) this._showFieldHelp(null); });
+      button.addEventListener("focus", () => this._showFieldHelp(key));
+      button.addEventListener("blur", () => this._showFieldHelp(null));
+      button.addEventListener("click", () => this._showFieldHelp(this._helpPinned && this._helpOpen === key ? null : key, !this._helpPinned));
+      button.addEventListener("keydown", (event) => { if (event.key === "Escape") { this._showFieldHelp(null); event.preventDefault(); } });
+    });
     query("[data-room]")?.addEventListener("change", (event) => this._selectRoom(event.target.value));
     query("[data-save]")?.addEventListener("click", () => this._save());
     query("[data-discard]")?.addEventListener("click", () => this._discard());
     query("[data-reconnect]")?.addEventListener("click", () => this._connect());
     this.shadowRoot.querySelectorAll("[data-key]").forEach((input) => input.addEventListener("input", () => this._edit(input.dataset.key, input.value)));
-    this.shadowRoot.querySelectorAll("[data-day]").forEach((button) => button.addEventListener("click", () => { this._day = button.dataset.day; this._render(); }));
+    this.shadowRoot.querySelectorAll("[data-day]").forEach((button) => button.addEventListener("click", () => { this._day = button.dataset.day; this._copyOpen = false; this._copyTargets.clear(); this._render(); }));
     this.shadowRoot.querySelectorAll("[data-part]").forEach((input) => input.addEventListener("input", () => { const copy = cloneRoomValue(this._rows()); copy[Number(input.dataset.index)][input.dataset.part] = input.value; this._editRows(copy); }));
-    this.shadowRoot.querySelectorAll('[data-part="time"]').forEach((input) => input.addEventListener("change", () => {
-      const value = normalizeRoomTime(input.value); input.value = value;
-      const copy = cloneRoomValue(this._rows()); copy[Number(input.dataset.index)].time = value; this._editRows(copy);
-    }));
     this.shadowRoot.querySelectorAll("[data-remove]").forEach((button) => button.addEventListener("click", () => { const index = Number(button.dataset.remove); if (!index || this._locked("week_profile")) return; const copy = cloneRoomValue(this._rows()); copy.splice(index, 1); this._editRows(copy); this._render(); }));
     query("[data-add]")?.addEventListener("click", () => this._addRow());
-    query("[data-copy]")?.addEventListener("click", () => this._copyDay());
+    query("[data-copy]")?.addEventListener("click", () => { this._copyOpen = !this._copyOpen; this._copyTargets.clear(); this._render(); });
+    this.shadowRoot.querySelectorAll("[data-copy-target]").forEach((input) => input.addEventListener("change", () => {
+      if (input.checked) this._copyTargets.add(input.dataset.copyTarget);
+      else this._copyTargets.delete(input.dataset.copyTarget);
+      const apply = query("[data-copy-apply]");
+      apply.textContent = `Auf ${this._copyTargets.size} ${this._copyTargets.size === 1 ? "Tag" : "Tage"} übernehmen`;
+      this._updatePreview();
+    }));
+    query("[data-copy-all]")?.addEventListener("click", () => { this._copyTargets = new Set(ROOM_DAYS.filter((day) => day !== this._day)); this._render(); });
+    query("[data-copy-none]")?.addEventListener("click", () => { this._copyTargets.clear(); this._render(); });
+    query("[data-copy-cancel]")?.addEventListener("click", () => { this._copyOpen = false; this._copyTargets.clear(); this._render(); });
+    query("[data-copy-apply]")?.addEventListener("click", () => this._copyDay());
     query("[data-new]")?.addEventListener("click", () => { this._editRows([{ time: "00:00", temperature: "" }]); this._render(); });
-    query("[data-template]")?.addEventListener("change", (event) => { const device = room.devices[event.target.value]; if (device) { this._editRows(CulMaxRoomProfile.parse(device.confirmed.week_profile[this._day])); this._render(); } });
     this.shadowRoot.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => { const device = room.devices.find((d) => d.config_entry_id === button.dataset.owner && d.jobs.some((j) => j.id === button.dataset.cancel)); const job = device?.jobs.find((j) => j.id === button.dataset.cancel); if (job) this._cancel(job, device.config_entry_id); }));
     if (focusKey) {
       const input = this.shadowRoot.querySelector(`[data-focus="${focusKey}"]`);
@@ -341,7 +409,7 @@ class CulMaxRoomConfigCard extends HTMLElement {
     }
   }
   static trash = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2m-3 6h12l-1 12H7L6 9m4 2v8h1v-8h-1m3 0v8h1v-8h-1Z"/></svg>';
-  static styles = `:host{display:block;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,inherit)}*{box-sizing:border-box}ha-card{display:block;background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ddd);border-radius:var(--ha-card-border-radius,20px);padding:20px}.header{display:flex;align-items:center;justify-content:space-between;gap:12px}h2{font-size:1.35rem;margin:0;min-width:0;overflow-wrap:anywhere}h3{font-size:1.05rem;margin:0 0 16px}h4{font-size:1rem;margin:0}.subtitle,.template,.row-heading span,small{color:var(--secondary-text-color,#666);font-size:.88rem;line-height:1.5}.badge{background:var(--secondary-background-color,#eee);padding:6px 10px;border-radius:20px;font-size:.8rem}.room{display:grid;gap:6px;margin:20px 0 10px;font-weight:600}section{border-top:1px solid var(--divider-color,#ddd);margin-top:22px;padding-top:20px}.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.fields label{font-size:.9rem}.input-unit{display:flex;align-items:center;gap:8px;margin-top:7px}.input-unit input{width:100%}input,select,button{font:inherit;color:var(--primary-text-color);background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ccc);border-radius:22px;min-height:44px;padding:9px 14px;max-width:100%;min-width:0}select{width:100%}input:focus,select:focus,button:focus-visible{outline:2px solid var(--primary-color,#519eb5);outline-offset:2px}button{cursor:pointer;transition:background .15s}button:hover:not(:disabled){background:var(--secondary-background-color,#eee)}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:default}button.primary,button.selected{background:var(--primary-text-color,#111);color:var(--card-background-color,#fff);border-color:transparent}button.primary:hover:not(:disabled){opacity:.85;background:var(--primary-text-color,#111)}.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}.days button{padding:7px 2px;min-height:38px}.switch-row{display:grid;grid-template-columns:minmax(0,1fr) 18px minmax(0,1fr) 23px 32px;align-items:center;gap:10px;margin:9px 0}.switch-row input{width:100%}.icon{border:0;border-radius:50%;padding:6px;min-height:36px;display:flex;justify-content:center}.wide{display:block;width:100%;margin-top:12px}.row-heading{display:flex;justify-content:space-between;gap:8px;margin:18px 0 12px}.status{display:block;color:var(--secondary-text-color);font-size:.8rem;font-weight:400;margin-top:6px}.template{display:grid;gap:6px;margin-top:16px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-top:1px solid var(--divider-color);padding-top:20px;margin-top:22px}.error{color:var(--error-color,#b33);margin-top:12px;font-size:.9rem;overflow-wrap:anywhere}.error:empty{display:none}.notice{background:var(--secondary-background-color,#eee);border-radius:12px;padding:12px;margin:12px 0;font-size:.9rem}.compact{min-height:34px;padding:5px 10px;font-size:.8rem}.empty{padding:32px 8px;color:var(--secondary-text-color);text-align:center;line-height:1.5}[data-graph]{min-height:180px;margin-top:12px}svg{display:block;width:100%;max-height:310px}svg text{fill:var(--secondary-text-color,#777);font-size:14px}.grid line{stroke:var(--divider-color,#ddd);stroke-dasharray:6 5}.curve{stroke:var(--primary-color,#519eb5);stroke-width:4;fill:none;stroke-linejoin:round}.fill{fill:var(--primary-color,#519eb5);opacity:.12}details{margin-top:22px;font-size:.9rem}summary{cursor:pointer;min-height:30px}.device{padding:12px 0;border-top:1px solid var(--divider-color);margin-top:8px}.device strong{overflow-wrap:anywhere}.device small{display:block}.job{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:8px;overflow-wrap:anywhere}@media(max-width:480px){ha-card{padding:14px}.fields{grid-template-columns:1fr}.switch-row{gap:5px;grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) 20px 28px}.switch-row input{padding:9px 8px}.row-heading span{font-size:.75rem}h2{font-size:1.12rem}.header{align-items:flex-start}.badge{font-size:.7rem}.days button{font-size:.85rem}.job{align-items:flex-start}}`;
+  static styles = `:host{display:block;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,inherit)}*{box-sizing:border-box}ha-card{display:block;background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ddd);border-radius:var(--ha-card-border-radius,20px);padding:20px}.header{display:flex;align-items:center;justify-content:space-between;gap:12px}h2{font-size:1.35rem;margin:0;min-width:0;overflow-wrap:anywhere}h3{font-size:1.05rem;margin:0 0 16px}h4{font-size:1rem;margin:0}.row-heading span,small{color:var(--secondary-text-color,#666);font-size:.88rem;line-height:1.5}.badge{background:var(--secondary-background-color,#eee);padding:6px 10px;border-radius:20px;font-size:.8rem}.room{display:grid;gap:6px;margin:20px 0 10px;font-weight:600}section{border-top:1px solid var(--divider-color,#ddd);margin-top:22px;padding-top:20px}.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.fields label{font-size:.9rem}.field{position:relative;min-width:0}.field-label{display:flex;align-items:center;gap:6px;min-height:32px}.help-button{display:inline-flex;align-items:center;justify-content:center;flex:none;min-height:32px;width:32px;padding:0;border:0;border-radius:50%;font-size:19px;color:var(--secondary-text-color,#666)}.field-tooltip{position:absolute;top:36px;left:0;right:0;z-index:5;padding:12px;border:1px solid var(--divider-color,#ccc);border-radius:10px;background:var(--ha-card-background,var(--card-background-color,#fff));box-shadow:0 4px 16px #0003;font-size:.88rem;line-height:1.5;overflow-wrap:anywhere}.input-unit{display:flex;align-items:center;gap:8px;margin-top:7px}.input-unit input{width:100%}input,select,button{font:inherit;color:var(--primary-text-color);background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ccc);border-radius:22px;min-height:44px;padding:9px 14px;max-width:100%;min-width:0}select{width:100%}input:focus,select:focus,button:focus-visible{outline:2px solid var(--primary-color,#519eb5);outline-offset:2px}button{cursor:pointer;transition:background .15s}button:hover:not(:disabled){background:var(--secondary-background-color,#eee)}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:default}button.primary,button.selected{background:var(--primary-text-color,#111);color:var(--card-background-color,#fff);border-color:transparent}button.primary:hover:not(:disabled){opacity:.85;background:var(--primary-text-color,#111)}.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}.days button{padding:7px 2px;min-height:38px;display:flex;align-items:center;justify-content:center;gap:5px}.dirty-dot{display:inline-block;flex:none;width:9px;height:9px;border-radius:50%;background:var(--primary-color,#519eb5);box-shadow:0 0 0 1px currentColor}.copy-panel{min-width:0;margin:16px 0 0;padding:14px;border:1px solid var(--divider-color,#ccc);border-radius:12px}.copy-panel legend{font-weight:600;padding:0 5px}.copy-days{display:flex;flex-wrap:wrap;gap:8px}.copy-days label{display:flex;align-items:center;gap:5px;min-height:44px;padding:0 6px;cursor:pointer}.copy-days input{width:20px;height:20px;min-height:0;padding:0;accent-color:var(--primary-color,#519eb5)}.copy-tools,.copy-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.copy-panel p{font-size:.88rem;line-height:1.5;color:var(--secondary-text-color,#666)}.switch-row{display:grid;grid-template-columns:minmax(0,1fr) 18px minmax(0,1fr) 23px 32px;align-items:center;gap:10px;margin:9px 0}.switch-row input{width:100%}.icon{border:0;border-radius:50%;padding:6px;min-height:36px;display:flex;justify-content:center}.wide{display:block;width:100%;margin-top:12px}.row-heading{display:flex;justify-content:space-between;gap:8px;margin:18px 0 12px}.status{display:block;color:var(--secondary-text-color);font-size:.8rem;font-weight:400;margin-top:6px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-top:1px solid var(--divider-color);padding-top:20px;margin-top:22px}.error{color:var(--error-color,#b33);margin-top:12px;font-size:.9rem;overflow-wrap:anywhere}.error:empty{display:none}.notice{background:var(--secondary-background-color,#eee);border-radius:12px;padding:12px;margin:12px 0;font-size:.9rem}.compact{min-height:34px;padding:5px 10px;font-size:.8rem}.empty{padding:32px 8px;color:var(--secondary-text-color);text-align:center;line-height:1.5}[data-graph]{min-height:180px;margin-top:12px}svg{display:block;width:100%;max-height:310px}svg text{fill:var(--secondary-text-color,#777);font-size:14px}.grid line{stroke:var(--divider-color,#ddd);stroke-dasharray:6 5}.curve{stroke:var(--primary-color,#519eb5);stroke-width:4;fill:none;stroke-linejoin:round}.fill{fill:var(--primary-color,#519eb5);opacity:.12}details{margin-top:22px;font-size:.9rem}summary{cursor:pointer;min-height:30px}.device{padding:12px 0;border-top:1px solid var(--divider-color);margin-top:8px}.device strong{overflow-wrap:anywhere}.device small{display:block}.job{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:8px;overflow-wrap:anywhere}@media(max-width:480px){ha-card{padding:14px}.fields{grid-template-columns:1fr}.switch-row{gap:5px;grid-template-columns:minmax(0,1.6fr) 12px minmax(0,.7fr) 20px 28px}.switch-row input{padding:9px 8px}.row-heading span{font-size:.75rem}h2{font-size:1.12rem}.header{align-items:flex-start}.badge{font-size:.7rem}.days button{font-size:.85rem}.job{align-items:flex-start}}`;
 }
 
 class CulMaxRoomConfigCardEditor extends HTMLElement {

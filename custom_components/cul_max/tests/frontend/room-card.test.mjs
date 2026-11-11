@@ -34,7 +34,7 @@ function setup() {
   }, callWS: async (call) => { calls.push(call); if (failSave && call.service === "save_room_config") throw Error("Konflikt");
     return { response: call.service === "get_room_config" ? { rooms: structuredClone(rooms) } : { status: "accepted", job_ids: ["job"] } }; } };
   card.setConfig({ type: "custom:cul-max-room-config-card" }); card.hass = hass;
-  return { card, Profile, normalize: vm.runInContext("normalizeRoomTime", context), rooms, hass, calls, events, elements, push: () => push({ rooms: structuredClone(rooms) }),
+  return { card, Profile, rooms, hass, calls, events, elements, push: () => push({ rooms: structuredClone(rooms) }),
     setConfirm: (value) => { confirmed = value; }, failSave: () => { failSave = true; }, unsubscribed: () => unsubscribed };
 }
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -57,7 +57,7 @@ test("room and day controls render escaped data without polling on hass state ch
   env.rooms[0].name = "<script>Wohnzimmer</script>"; env.push();
   assert.match(env.card.shadowRoot.innerHTML, /&lt;script&gt;/);
   assert.match(env.card.shadowRoot.innerHTML, /Komforttemperatur/);
-  assert.match(env.card.shadowRoot.innerHTML, /Tag auf alle Tage kopieren/);
+  assert.match(env.card.shadowRoot.innerHTML, /Tag auf andere Tage kopieren/);
   const html = env.card.shadowRoot.innerHTML;
   env.card.hass = { ...env.hass, states: { anything: {} } };
   assert.equal(env.card.shadowRoot.innerHTML, html);
@@ -77,17 +77,71 @@ test("editing emits no calls; one Save includes temperature and profile changes"
   assert.match(env.card._message, /eingereiht/);
 });
 
-test("day copy deep clones the draft and only Save can transmit", async () => {
+test("copy only replaces selected targets, preserves other drafts and deep clones rows", async () => {
+  const env = setup(); await tick();
+  env.card._editRows(env.Profile.parse("19,06:00,22"));
+  env.card._day = "sunday";
+  env.card._editRows(env.Profile.parse("23"));
+  env.card._day = "monday";
+  env.card._copyTargets.add("tuesday");
+  env.card._copyTargets.add("wednesday");
+  env.card._copyDay();
+  assert.deepEqual(Object.keys(env.card._changes.week_profile).sort(), ["monday", "sunday", "tuesday", "wednesday"]);
+  env.card._changes.week_profile.monday[0].temperature = 24;
+  assert.equal(env.card._changes.week_profile.tuesday[0].temperature, 19);
+  assert.equal(env.card._changes.week_profile.wednesday[0].temperature, 19);
+  assert.equal(env.card._changes.week_profile.sunday[0].temperature, 23);
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.card._copyOpen, false);
+  assert.equal(env.card._copyTargets.size, 0);
+});
+
+test("copy requires targets and respects locks and invalid input", async () => {
   const env = setup(); await tick();
   env.card._copyDay();
-  assert.equal(Object.keys(env.card._changes.week_profile).length, 7);
-  env.card._changes.week_profile.monday[0].temperature = 24;
-  assert.equal(env.card._changes.week_profile.tuesday[0].temperature, 17);
-  assert.equal(env.calls.length, 0);
-  env.setConfirm(false);
-  const previous = JSON.stringify(env.card._changes);
+  assert.equal(env.card._changes.week_profile, undefined);
+  env.card._copyTargets.add("tuesday");
+  env.rooms[0].locks.week_profile = true; env.push();
   env.card._copyDay();
-  assert.equal(JSON.stringify(env.card._changes), previous);
+  assert.equal(env.card._changes.week_profile, undefined);
+  env.rooms[0].locks.week_profile = false; env.push();
+  env.card._editRows([{ time: "00:00", temperature: "" }]);
+  env.card._copyDay();
+  assert.equal(env.card._changes.week_profile.tuesday, undefined);
+});
+
+test("reverting a day removes its draft and copying identical rows creates no change", async () => {
+  const env = setup(); await tick();
+  const original = env.Profile.parse(env.rooms[0].values.week_profile.monday);
+  env.card._editRows(env.Profile.parse("19"));
+  assert.match(env.card._dayLabel("monday"), /ungespeicherte Änderungen/);
+  env.card._editRows(original);
+  assert.equal(env.card._changes.week_profile, undefined);
+  assert.equal(env.card._dayLabel("monday"), "Montag");
+  assert.equal(env.card._dirty(), false);
+  env.card._copyTargets.add("tuesday");
+  env.card._copyDay();
+  assert.equal(env.card._changes.week_profile, undefined);
+});
+
+test("invalid legacy day drafts can be corrected, copied over and saved", async () => {
+  for (const invalid of ["ungueltig", "17,06:01,21", "17,06:00,"]) {
+    const env = setup(); await tick();
+    env.rooms[0].values.week_profile.monday = invalid;
+    env.rooms[0].values.week_profile.wednesday = invalid;
+    env.push();
+    env.card._editRows(env.Profile.parse("19,06:00,22"));
+    assert.equal(env.card._canSave(), true);
+    env.card._copyTargets.add("tuesday");
+    env.card._copyTargets.add("wednesday");
+    env.card._copyDay();
+    assert.equal(env.Profile.serialize(env.card._changes.week_profile.wednesday), "19,06:00,22");
+    await env.card._save();
+    const request = env.calls.find((call) => call.service === "save_room_config");
+    for (const day of ["monday", "tuesday", "wednesday"]) {
+      assert.equal(request.service_data.changes.week_profile[day], "19,06:00,22");
+    }
+  }
 });
 
 test("block locks and external conflicts preserve edits and block saving", async () => {
@@ -170,13 +224,15 @@ test("accepted operations report final confirmation only when all jobs complete"
   assert.match(env.card._message, /Alle Konfigurationsänderungen sind bestätigt/);
 });
 
-test("24-hour input normalization accepts numeric mobile input without AM/PM", () => {
-  const env = setup();
-  assert.equal(env.normalize("0630"), "06:30");
-  assert.equal(env.normalize("6:30"), "06:30");
-  assert.equal(env.normalize("6"), "06:00");
-  env.card._editRows([{ time: "00:00", temperature: 20 }]);
-  assert.match(env.card.shadowRoot.innerHTML, /type="text" inputmode="numeric"/);
+test("native time fields use five-minute steps and device template control is absent", async () => {
+  const env = setup(); await tick();
+  assert.match(env.card.shadowRoot.innerHTML, /type="time" min="00:00" max="23:55" step="300"/);
+  assert.doesNotMatch(env.card.shadowRoot.innerHTML, /data-template|Tagesprofil von einem Raumgerät/);
+  env.card._copyOpen = true; env.card._render();
+  assert.match(env.card.shadowRoot.innerHTML, /Montagsprofil kopieren auf/);
+  assert.doesNotMatch(env.card.shadowRoot.innerHTML, /data-copy-target="monday"/);
+  assert.match(env.card.shadowRoot.innerHTML, /data-copy-target="sunday"/);
+  assert.match(env.card.shadowRoot.innerHTML, /data-copy-apply disabled/);
 });
 
 test("a removed selected room keeps its draft and cannot save into another room", async () => {
