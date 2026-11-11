@@ -142,3 +142,50 @@ test("next dispatch sorts before older waiting work and temperature jobs have th
   card._render();
   assert.match(card.shadowRoot.innerHTML, /Funkbudget nicht verfügbar/);
 });
+
+test("registry renames refresh existing entries and jobs and detach unsubscribes", async () => {
+  const {card,controller,hass} = await setup();
+  await tick();
+  let push, removed=0;
+  const connection={...hass.connection,subscribeEvents:async(callback,type)=>{assert.equal(type,"device_registry_updated");push=callback;return()=>removed++;}};
+  card.hass={...hass,connection};
+  await tick();
+  controller.entries=[{id:"entry",description:"Temperature",device_name:"Heizung Bad",device_address:"123456",scope:"general",status:"queued"}];
+  controller.jobs=[{id:"job",description:"Week profile",device_name:"Heizung Bad",device_address:"123456",scope:"configuration",status:"queued"}];
+  push({data:{action:"update",changes:{name_by_user:"old name"}}});
+  await tick();
+  assert.match(card.shadowRoot.innerHTML,/Heizung Bad/);
+  controller.entries[0].device_name="Neu & umbenannt";
+  controller.jobs[0].device_name="Neu & umbenannt";
+  push({data:{action:"update",changes:{name_by_user:"Heizung Bad"}}});
+  await tick();
+  assert.match(card.shadowRoot.innerHTML,/Neu &amp; umbenannt/);
+  card.disconnectedCallback();
+  assert.equal(removed,1);
+});
+
+test("late registry subscription after detach is released", async () => {
+  const {card,hass,calls}=await setup();
+  await tick();
+  let resolve,removed=0,push;
+  card.hass={...hass,connection:{...hass.connection,subscribeEvents:cb=>{push=cb;return new Promise(done=>resolve=done);}}};
+  await tick();
+  card.isConnected=false;
+  card.disconnectedCallback();
+  const before=calls.length;
+  resolve(()=>removed++);
+  await tick();
+  push({data:{action:"remove"}});
+  await tick();
+  assert.equal(removed,1);
+  assert.equal(calls.length,before);
+});
+
+test("registry subscription errors remain visible after a successful queue refresh", async () => {
+  const {card,hass}=await setup();
+  await tick();
+  card.hass={...hass,connection:{...hass.connection,subscribeEvents:async()=>{throw Error("Nicht erlaubt");}}};
+  await tick();
+  await card._refresh();
+  assert.match(card.shadowRoot.innerHTML,/Namensänderungen können nicht automatisch geladen werden/);
+});

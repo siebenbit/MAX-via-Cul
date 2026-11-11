@@ -1478,3 +1478,8 @@ Die Karte vergibt keine Namen oder Räume automatisch und erstellt keine Funklin
 Beim erneuten Pairing einer bekannten Funkadresse bleiben der gespeicherte
 Wochenplan, Temperaturparameter, Verknüpfungen und Zustandsdaten erhalten.
 Bereits zuvor überschriebene Profile werden dadurch nicht rekonstruiert.
+
+Die Sendewarteschlange zeigt den aktuellen HA-Gerätenamen auch für bereits
+wartende Einzel- und Konfigurationsaufträge. Umbenennungen werden automatisch
+übernommen. Ohne HA-Gerätenamen wird der interne Name beziehungsweise die
+Funkadresse verwendet; gespeicherte Befehlsbeschreibungen bleiben unverändert.

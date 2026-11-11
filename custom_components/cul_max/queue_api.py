@@ -19,7 +19,7 @@ def select_controller(controllers: dict, entry_id: str | None):
     return next(iter(controllers.values()))
 
 
-def queue_snapshot(controllers: dict, filters: dict[str, Any]) -> dict:
+def queue_snapshot(controllers: dict, filters: dict[str, Any], *, registry=None) -> dict:
     result = {"controllers": [], "entries": [], "jobs": []}
     for entry_id, coordinator in controllers.items():
         if filters.get("config_entry_id") and entry_id != filters["config_entry_id"]:
@@ -32,8 +32,16 @@ def queue_snapshot(controllers: dict, filters: dict[str, Any]) -> dict:
                 not filters.get("statuses") or item.get("status") in filters["statuses"]) and (
                 not filters.get("command_types") or item.get("command_type") in filters["command_types"]) and (
                 not filters.get("scope") or item.get("scope") == filters["scope"])
-        snapshot["entries"] = [item | {"config_entry_id": entry_id} for item in snapshot["entries"] if matches(item)]
-        snapshot["jobs"] = [item | {"config_entry_id": entry_id} for item in snapshot["jobs"] if matches(item)]
+        def display_item(item):
+            address = item.get("device_address")
+            name = item.get("device_name")
+            if address:
+                device = coordinator.get_device(address)
+                entry = registry.async_get_device(identifiers={(DOMAIN, address.upper())}) if registry is not None else None
+                name = ((entry.name_by_user or entry.name) if entry else None) or (device.name if device else None) or name or address
+            return item | {"config_entry_id": entry_id, "device_name": name}
+        snapshot["entries"] = [display_item(item) for item in snapshot["entries"] if matches(item)]
+        snapshot["jobs"] = [display_item(item) for item in snapshot["jobs"] if matches(item)]
         result["entries"].extend(snapshot["entries"])
         result["jobs"].extend(snapshot["jobs"])
         result["controllers"].append(snapshot)
@@ -45,7 +53,7 @@ def register_queue_services(hass) -> None:
     import voluptuous as vol
     from homeassistant.core import SupportsResponse
     from homeassistant.exceptions import ServiceValidationError
-    from homeassistant.helpers import config_validation as cv
+    from homeassistant.helpers import config_validation as cv, device_registry as dr
 
     if hass.services.has_service(DOMAIN, "get_queue"):
         return
@@ -57,7 +65,7 @@ def register_queue_services(hass) -> None:
             if call.service == "get_queue":
                 if data.get("config_entry_id"):
                     select_controller(controllers, data["config_entry_id"])
-                return queue_snapshot(controllers, data)
+                return queue_snapshot(controllers, data, registry=dr.async_get(hass))
             if call.service == "delete_queue_entry":
                 ids = data.get("entry_ids") or [data["entry_id"]]
                 removed, protected = [], []

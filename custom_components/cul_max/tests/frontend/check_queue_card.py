@@ -69,6 +69,10 @@ with preview_server() as origin, sync_playwright() as p:
     page.screenshot(path="/tmp/cul-max-queue-dark-mobile.png", full_page=True)
     page.evaluate("controller.entries=[]; controller.jobs=[]; reconnectFixture()")
     expect(card.get_by_text("Keine wartenden Aufträge", exact=True)).to_be_visible()
+    page.evaluate("resetFixture()")
+    page.evaluate("controller.entries[0].device_name='HA Heizung Bad';controller.jobs[0].device_name='HA Wochenplan';listeners.get('device_registry_updated')({data:{action:'update',changes:{name_by_user:'Bad'}}})")
+    expect(card.locator(".device").filter(has_text="HA Heizung Bad")).to_be_visible()
+    expect(card.locator(".device").filter(has_text="HA Wochenplan")).to_be_visible()
     assert not errors, errors
     browser.close()
     print("Browser checks passed: rendering, delete, errors, confirmations, protected commands, jobs, empty queue, reconnect, dark/mobile")

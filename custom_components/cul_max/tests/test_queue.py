@@ -292,6 +292,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         callbacks = {}
         class ValidationError(ValueError):
             pass
+        dr = types.ModuleType("homeassistant.helpers.device_registry")
+        ha_entry = types.SimpleNamespace(name_by_user="HA Heizung", name="Default")
+        dr.async_get = lambda hass: types.SimpleNamespace(async_get_device=lambda **kwargs: ha_entry)
         cv = types.ModuleType("homeassistant.helpers.config_validation")
         cv.string = str
         cv.boolean = bool
@@ -310,7 +313,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         hass = types.SimpleNamespace(data={api.CONTROLLERS: {"one": self.c}}, services=services)
         with patch.dict(sys.modules, {"voluptuous": vol, "homeassistant": types.ModuleType("homeassistant"),
                         "homeassistant.helpers": types.ModuleType("homeassistant.helpers"), "homeassistant.core": core,
-                        "homeassistant.exceptions": exceptions, "homeassistant.helpers.config_validation": cv}):
+                        "homeassistant.exceptions": exceptions, "homeassistant.helpers.config_validation": cv,
+                        "homeassistant.helpers.device_registry": dr}):
             api.register_queue_services(hass)
         self.assertEqual(set(callbacks), set(api.SERVICES))
         task = self.temperature(20)
@@ -320,6 +324,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             return callbacks[service](types.SimpleNamespace(service=service, data=data, return_response=response))
         listed = await call("get_queue", {})
         self.assertEqual(listed["entries"][0]["id"], entry.id)
+        self.assertEqual(listed["entries"][0]["device_name"], "HA Heizung")
         deleted = await call("delete_queue_entry", {"entry_ids": [entry.id, "missing"]})
         self.assertEqual(deleted["removed"], [entry.id])
         self.assertEqual(deleted["protected"][0]["id"], "missing")

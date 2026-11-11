@@ -54,8 +54,30 @@ class CulMaxQueueCard extends HTMLElement {
     this._attached = this._hass.connection;
     this._attached.addEventListener("ready", this._onReady);
     this._attached.addEventListener("disconnected", this._onDisconnected);
+    this._watchDeviceNames(this._attached);
+  }
+  async _watchDeviceNames(connection) {
+    const epoch = this._registryEpoch = (this._registryEpoch || 0) + 1;
+    if (typeof connection.subscribeEvents !== "function") return;
+    try {
+      const unsubscribe = await connection.subscribeEvents((event) => {
+        if (epoch !== this._registryEpoch || !this.isConnected) return;
+        const { action, changes = {} } = event.data || {};
+        if (action !== "update" || "name" in changes || "name_by_user" in changes) this._refresh();
+      }, "device_registry_updated");
+      if (epoch !== this._registryEpoch || !this.isConnected) unsubscribe();
+      else { this._registryUnsubscribe = unsubscribe; this._registryError = null; this._refresh(); }
+    } catch (error) {
+      if (epoch === this._registryEpoch) {
+        this._registryError = `Namensänderungen können nicht automatisch geladen werden: ${error.message || error}`;
+        this._render();
+      }
+    }
   }
   _detach() {
+    this._registryEpoch = (this._registryEpoch || 0) + 1;
+    this._registryUnsubscribe?.();
+    this._registryUnsubscribe = null;
     this._attached?.removeEventListener("ready", this._onReady);
     this._attached?.removeEventListener("disconnected", this._onDisconnected);
     this._attached = null;
@@ -188,6 +210,7 @@ class CulMaxQueueCard extends HTMLElement {
       ${next && !items.some(isNext) ? '<div class="muted">Der nächste Versand betrifft einen ausgeblendeten Auftrag.</div>' : ""}
       ${credits ? `<details data-preserve="budget"><summary>Funkdetails</summary><div class="muted">Zuletzt gemeldet: ${h(credits.reported_credits ?? "unbekannt")} Credits · Gemessen: ${h(this._time(credits.last_budget_query_at))}<br>Nächstes Paket einschließlich Reserve: ${h(credits.required_credits ?? "unbekannt")} Credits</div>${credits.last_budget_error ? `<div class="error">${h(credits.last_budget_error)}</div>` : ""}</details>` : ""}
       ${this._error ? `<div class="notice error" role="alert">${h(this._error)}</div><button id="reload">Erneut laden</button>` : ""}
+      ${this._registryError ? `<div class="notice error" role="alert">${h(this._registryError)}</div>` : ""}
       ${this._message ? `<div class="notice" role="status">${h(this._message)}</div>` : ""}
       <div class="rows">${items.map((item) => {
         const isJob = item.scope === "configuration";

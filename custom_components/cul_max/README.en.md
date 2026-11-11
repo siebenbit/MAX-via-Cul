@@ -1069,3 +1069,7 @@ RF peer links are not assigned automatically.
 Re-pairing a known radio address preserves its stored week profile, temperature
 parameters, links and state. Previously overwritten profiles cannot be recovered
 by this fix.
+
+The queue displays the current HA device name for existing commands and
+configuration jobs, including subsequent renames. Missing HA names fall back to
+the internal name or radio address. Stored command descriptions remain unchanged.

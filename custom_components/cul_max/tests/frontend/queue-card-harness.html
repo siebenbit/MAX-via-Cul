@@ -22,7 +22,7 @@ await customElements.whenDefined("cul-max-queue-card");
   window.calls = [];
   window.failNext = false;
   window.card = document.querySelector("cul-max-queue-card");
-  window.hass = {states:{}, connection:{addEventListener:(key,fn)=>listeners.set(key,fn),removeEventListener:(key)=>listeners.delete(key)},
+  window.hass = {states:{}, connection:{subscribeEvents:async(fn,type)=>{listeners.set(type,fn);return()=>listeners.delete(type);},addEventListener:(key,fn)=>listeners.set(key,fn),removeEventListener:(key)=>listeners.delete(key)},
     callWS: async (call) => {
       calls.push(call);
       if (failNext) { failNext=false; throw Error("Status inzwischen geändert"); }
