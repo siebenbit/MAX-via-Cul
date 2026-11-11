@@ -173,6 +173,18 @@ Hinweis zur Sollwert-Semantik:
   besser erkennen, ob ein Thermostat gerade wirklich im normalen
   Wochenprogramm laeuft oder in einem temporaeren Geraetezustand steckt.
 
+### Isttemperatur und Empfangszeit
+
+Heizkoerperthermostate, Heizkoerperthermostate Plus und Wandthermostate erhalten
+einen normalen Sensor `Isttemperatur`. Er zeigt den zuletzt gemeldeten Messwert
+und kann in Home Assistant als Temperatursensor eines Raums ausgewaehlt werden.
+Unter Diagnose zeigt `Letzte Temperaturmeldung` den Empfangszeitpunkt in HA,
+nicht den internen Messzeitpunkt. Beide Werte bleiben ueber Neustarts erhalten.
+Bei aelteren gespeicherten Temperaturen ist der Zeitpunkt bis zur naechsten
+Temperaturmeldung unbekannt. Es werden keine zusaetzlichen Funkabfragen gesendet.
+Nach dem Update reicht ein Neuladen der Integration oder HA-Neustart; erneutes
+Pairing ist nicht erforderlich. Den Raumsensor anschliessend manuell auswaehlen.
+
 ### Fensterkontakte
 
 Fuer echte und virtuelle MAX!-Fensterkontakte:

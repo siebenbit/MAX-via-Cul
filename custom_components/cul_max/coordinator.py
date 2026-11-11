@@ -4974,6 +4974,10 @@ class CulMaxCoordinator:
         if address in self._devices:
             device = self._devices[address]
             state = dict(state)
+            if "measured_temperature" in state:
+                measured = state["measured_temperature"]
+                if isinstance(measured, bool) or not isinstance(measured, (int, float)) or not math.isfinite(measured):
+                    state.pop("measured_temperature")
             target = state.get("desired_temperature")
             if isinstance(target, (int, float)) and TEMP_MIN < target <= TEMP_MAX:
                 device.last_normal_target = target
@@ -4982,7 +4986,7 @@ class CulMaxCoordinator:
             if device.device_type in CLIMATE_DEVICE_TYPES:
                 now = datetime.now(UTC).isoformat()
                 state["reported_at"] = now
-                for key in ("mode", "valve_position"):
+                for key in ("mode", "valve_position", "measured_temperature"):
                     if key in state:
                         state[f"{key}_reported_at"] = now
             self._devices[address].last_state = {

@@ -30,7 +30,7 @@ def load_sensors():
     modules["homeassistant.util.dt"].parse_datetime = lambda value: datetime.fromisoformat(value) if value else None
     sensor_api = modules["homeassistant.components.sensor"]
     sensor_api.SensorEntity = object
-    sensor_api.SensorDeviceClass = types.SimpleNamespace(TIMESTAMP="timestamp")
+    sensor_api.SensorDeviceClass = types.SimpleNamespace(TIMESTAMP="timestamp", TEMPERATURE="temperature")
     sensor_api.SensorStateClass = types.SimpleNamespace(MEASUREMENT="measurement", TOTAL_INCREASING="total_increasing")
     modules["homeassistant.const"].UnitOfTemperature = types.SimpleNamespace(CELSIUS="°C")
     modules["homeassistant.const"].EntityCategory = types.SimpleNamespace(DIAGNOSTIC="diagnostic")
@@ -874,6 +874,67 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(timestamp)
         await self.report(payload=bytes([0, 1, 40]), kind=0x70)
         self.assertEqual(sensor.extra_state_attributes["last_reported_at"], timestamp)
+
+    async def test_temperature_sensors_track_only_actual_temperature_reports(self):
+        sensors = load_sensors()
+        device = self.c.get_device("123456")
+        temperature = sensors.CulMaxMeasuredTemperatureSensor(self.c, device)
+        timestamp = sensors.CulMaxTemperatureReportTimeSensor(self.c, device)
+        device.last_state.pop("measured_temperature", None)
+        self.assertIsNone(temperature.native_value)
+        self.assertIsNone(timestamp.native_value)
+        self.assertEqual(temperature._attr_device_class, "temperature")
+        self.assertFalse(hasattr(temperature, "_attr_entity_category"))
+        self.assertEqual(timestamp._attr_entity_category, "diagnostic")
+        writes, removers = [], []
+        for sensor in (temperature, timestamp):
+            sensor.async_write_ha_state = lambda: writes.append((temperature.native_value, timestamp.native_value))
+            sensor.async_on_remove = removers.append
+            await sensor.async_added_to_hass()
+        try:
+            for kind in mod.CLIMATE_DEVICE_TYPES:
+                device.device_type = kind
+                built = sensors._build_diagnostic_entities(self.c, device)
+                self.assertEqual(sum(isinstance(item, sensors.CulMaxMeasuredTemperatureSensor) for item in built), 1)
+                self.assertEqual(sum(isinstance(item, sensors.CulMaxTemperatureReportTimeSensor) for item in built), 1)
+            for kind in (mod.DEVICE_SHUTTER_CONTACT, 5):
+                device.device_type = kind
+                self.assertFalse(any(isinstance(item, sensors._CulMaxTemperatureReportSensor)
+                                     for item in sensors._build_diagnostic_entities(self.c, device)))
+            device.device_type = mod.DEVICE_WALL_THERMOSTAT
+            await self.report(payload=bytes([44, 190]), kind=0x42)
+            await self.settle()
+            self.assertEqual(temperature.native_value, 19)
+            first = timestamp.native_value
+            self.assertIsNotNone(first.tzinfo)
+            await self.report(payload=bytes([44, 190]), kind=0x42)
+            await self.settle()
+            self.assertGreater(timestamp.native_value, first)
+            received = timestamp.native_value
+            for value in (None, float("nan"), True):
+                await self.c._update_device_state(device.address, {"measured_temperature": value})
+            await self.report(payload=bytes([0, 1, 40]), kind=0x70)
+            await self.complete(23)
+            self.assertEqual(temperature.native_value, 19)
+            self.assertEqual(timestamp.native_value, received)
+            self.assertTrue(writes)
+            self.c._store = types.SimpleNamespace(async_save=AsyncMock())
+            await mod.CulMaxCoordinator._save_devices(self.c)
+            saved = self.c._store.async_save.call_args.args[0]
+            fresh = mod.CulMaxCoordinator(types.SimpleNamespace(loop=self.clock), "simulated")
+            fresh._store = types.SimpleNamespace(async_load=AsyncMock(return_value=saved))
+            fresh._save_devices = AsyncMock()
+            fresh._sync_device_registry_entry = AsyncMock()
+            await fresh._load_devices()
+            restored = fresh.get_device(device.address)
+            self.assertEqual(sensors.CulMaxMeasuredTemperatureSensor(fresh, restored).native_value, 19)
+            self.assertEqual(sensors.CulMaxTemperatureReportTimeSensor(fresh, restored).native_value, received)
+            restored.last_state.pop("measured_temperature_reported_at")
+            self.assertIsNone(sensors.CulMaxTemperatureReportTimeSensor(fresh, restored).native_value)
+            self.assertEqual(sensors.CulMaxMeasuredTemperatureSensor(fresh, restored).native_value, 19)
+        finally:
+            for remove in removers:
+                remove()
 
     async def test_group_sensor_updates_after_assignment_and_removal(self):
         sensors = load_sensors()

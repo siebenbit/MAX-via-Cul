@@ -148,6 +148,17 @@ Press **Save Configuration** to send them to the device, or **Discard Draft**
 to abandon the edits. Direct service calls provide another way to configure
 devices.
 
+### Measured temperature and reception time
+
+Radiator thermostats, radiator thermostats Plus and wall thermostats expose a
+regular `Isttemperatur` sensor with the last reported measurement. It can be
+selected as an area's temperature sensor in Home Assistant. The diagnostic
+`Letzte Temperaturmeldung` sensor shows when HA received that measurement,
+not when the device measured it. Both values survive restarts. Older stored
+temperatures have an unknown reception time until the next temperature report.
+No additional RF queries are sent. Reload the integration or restart HA after
+updating; no re-pairing is required. Select the area sensor manually afterwards.
+
 ### Window contacts
 
 Physical and virtual MAX! contacts expose a `binary_sensor` for their

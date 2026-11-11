@@ -1,7 +1,7 @@
-"""Diagnostic sensor entities for MAX! devices."""
+"""Measurement and diagnostic sensor entities for MAX! devices."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -24,7 +24,7 @@ async def async_setup_entry(
     entry: CulMaxConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up diagnostic sensor entities for all known devices."""
+    """Set up measurement and diagnostic sensors for all known devices."""
     coordinator: CulMaxCoordinator = entry.runtime_data
     entities: list[SensorEntity] = [CulMaxCreditSensor(coordinator, entry.entry_id), CulMaxQueueSensor(coordinator, entry.entry_id)]
     known_ids: set[str] = set()
@@ -150,6 +150,54 @@ class CulMaxCreditSensor(SensorEntity):
     def _on_timer(self, _now) -> None:
         if self.extra_state_attributes["waiting_packets"]:
             self.async_write_ha_state()
+
+
+class _CulMaxTemperatureReportSensor(SensorEntity):
+    """Shared device identity and push updates for temperature report sensors."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _unique_suffix: str
+
+    def __init__(self, coordinator: CulMaxCoordinator, device: KnownDevice) -> None:
+        self._coordinator = coordinator
+        self._device = device
+        self._attr_unique_id = f"{DOMAIN}_{device.address}_{self._unique_suffix}"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, device.address)}, name=device.name)
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._coordinator.add_diagnostic_listener(
+            self._device.address, self.async_write_ha_state,
+        ))
+
+
+class CulMaxMeasuredTemperatureSensor(_CulMaxTemperatureReportSensor):
+    """Last received air temperature, usable as an HA area temperature sensor."""
+
+    _attr_name = "Isttemperatur"
+    _unique_suffix = "measured_temperature"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.last_state.get("measured_temperature")
+
+
+class CulMaxTemperatureReportTimeSensor(_CulMaxTemperatureReportSensor):
+    """Reception time of the last valid temperature report, not measurement time."""
+
+    _attr_name = "Letzte Temperaturmeldung"
+    _unique_suffix = "measured_temperature_reported_at"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self) -> datetime | None:
+        value = self._device.last_state.get("measured_temperature_reported_at")
+        return dt_util.parse_datetime(value) if value else None
 
 
 class CulMaxValvePositionSensor(SensorEntity):
@@ -732,7 +780,7 @@ def _build_diagnostic_entities(
     coordinator: CulMaxCoordinator,
     device: KnownDevice,
 ) -> list[SensorEntity]:
-    """Build all diagnostic sensor entities for a device."""
+    """Build measurement and diagnostic sensor entities for a device."""
     entities: list[SensorEntity] = [
         CulMaxIdentitySensor(coordinator, device),
         CulMaxPairingStateSensor(coordinator, device),
@@ -746,6 +794,8 @@ def _build_diagnostic_entities(
         CulMaxCommunicationStatusSensor(coordinator, device),
     ]
     if device.device_type in CLIMATE_DEVICE_TYPES:
+        entities.extend([CulMaxMeasuredTemperatureSensor(coordinator, device),
+                         CulMaxTemperatureReportTimeSensor(coordinator, device)])
         entities.insert(3, CulMaxExpectedWeekProfileTemperatureSensor(coordinator, device))
         entities.insert(4, CulMaxWeekProfileValidationSensor(coordinator, device))
     if device.device_type in (DEVICE_HEATING_THERMOSTAT, DEVICE_HEATING_THERMOSTAT_PLUS):
