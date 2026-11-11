@@ -33,5 +33,9 @@ with preview_server() as origin, sync_playwright() as p:
     page.wait_for_function("customElements.get('cul-max-week-profile-card') !== undefined")
     page.screenshot(path="/tmp/cul-max-shared-cards.png", full_page=True)
     assert not errors, errors
+    page.goto(origin + "/tests/frontend/pairing-card-harness.html")
+    expect(page.locator("cul-max-pairing-card").get_by_role("heading", name="MAX! Geräte anlernen")).to_be_visible()
+    assert any("cul-max-card-styles.js?v=fixture" in r for r in requests)
+    assert not errors, errors
     browser.close()
     print("Shared styles, module loading, tooltip preservation and week card checks passed")

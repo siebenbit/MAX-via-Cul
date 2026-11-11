@@ -51,6 +51,7 @@ from .const import (
     CLIMATE_DEVICE_TYPES,
     DEFAULT_WEEK_PROFILE,
     )
+from .pairing import PairingSession
 from .climate_state import ClimateStateModel
 from .queue import CommandQueueManager, CommandResult, QueueEntry, QueueStopped
 
@@ -449,6 +450,7 @@ class CulMaxCoordinator:
         self._writer: asyncio.StreamWriter | None = None
         self._read_task: asyncio.Task | None = None
         self._counter: int = 0
+        self.pairing_session = PairingSession()
         self._pairing_mode: bool = False
         self._pairing_task: asyncio.Task | None = None
         self._pairing_until: datetime | None = None
@@ -1020,6 +1022,13 @@ class CulMaxCoordinator:
     async def async_shutdown(self) -> None:
         """Close the TCP connection cleanly."""
         self._shutting_down = True
+        if self._pairing_task:
+            self._pairing_task.cancel()
+            await asyncio.gather(self._pairing_task, return_exceptions=True)
+            self._pairing_task = None
+        self._pairing_mode = False
+        self._pairing_until = None
+        self.pairing_session.active = False
         for task in list(self._time_sync_tasks):
             task.cancel()
         await asyncio.gather(*self._time_sync_tasks, return_exceptions=True)
@@ -1166,6 +1175,7 @@ class CulMaxCoordinator:
                 self._budget_failure(str(err) or "Credit query timed out")
         if self._writer is not None:
             self._connection_ready.set()
+        self._notify_pairing_state_updated()
         self._radio_changed.set()
         return True
 
@@ -1180,6 +1190,7 @@ class CulMaxCoordinator:
         writer = self._writer
         self._reader = None
         self._writer = None
+        self._notify_pairing_state_updated()
         if writer is not None:
             writer.close()
             try:
@@ -1442,7 +1453,10 @@ class CulMaxCoordinator:
 
         if msg.msg_type == MSG_PAIR_PING:
             if self._pairing_mode:
-                self._schedule_rx_response(self._handle_pair_ping(msg))
+                session_id = self.pairing_session.id
+                known = self.pairing_session.observe(session_id, msg.src_hex,
+                    bool(source_device and source_device.paired))
+                self._schedule_rx_response(self._handle_pair_ping(msg, session_id, known))
             else:
                 _LOGGER.info(
                     "PairPing from %s ignored because pairing mode is not active",
@@ -1605,24 +1619,40 @@ class CulMaxCoordinator:
 
     async def async_start_pairing(self, duration: int = PAIRING_DURATION) -> None:
         """Enter pairing mode for the requested number of seconds."""
+        if self._shutting_down:
+            raise ValueError("Integration wird beendet")
         if duration < 1:
             raise ValueError("Pairing-Dauer muss mindestens 1 Sekunde betragen.")
+        if self._pairing_task:
+            self._pairing_task.cancel()
         _LOGGER.info("MAX! pairing mode active for %d seconds", duration)
         self._pairing_mode = True
         self._pairing_until = datetime.now(UTC) + timedelta(seconds=duration)
-        if self._pairing_task:
-            self._pairing_task.cancel()
+        self.pairing_session.start(self._pairing_until)
         self._notify_pairing_state_updated()
-        self._pairing_task = self.hass.loop.create_task(self._pairing_timeout(duration))
+        self._pairing_task = self.hass.loop.create_task(self._pairing_timeout(duration, self.pairing_session.id))
 
-    async def _pairing_timeout(self, duration: int) -> None:
+    async def _pairing_timeout(self, duration: int, session_id: str | None = None) -> None:
+        session_id = self.pairing_session.id if session_id is None else session_id
         await asyncio.sleep(duration)
+        if self._shutting_down or session_id != self.pairing_session.id:
+            return
         self._pairing_mode = False
+        self.pairing_session.active = False
         self._pairing_until = None
         _LOGGER.info("MAX! pairing mode ended")
         self._notify_pairing_state_updated()
 
-    async def _handle_pair_ping(self, msg: MaxMessage) -> None:
+    async def _handle_pair_ping(self, msg: MaxMessage, session_id: str | None = None, known: bool | None = None) -> None:
+        try:
+            await self._process_pair_ping(msg, session_id, known)
+        except Exception as err:
+            if session_id == self.pairing_session.id:
+                self.pairing_session.error = str(err)
+                self._notify_pairing_state_updated()
+            raise
+
+    async def _process_pair_ping(self, msg: MaxMessage, session_id: str | None, known: bool | None = None) -> None:
         """Handle a PairPing — respond with PairPong and register the new device."""
         src = msg.src_hex
         _LOGGER.info("PairPing from new device %s (payload: %s)", src, msg.payload.hex())
@@ -1662,6 +1692,8 @@ class CulMaxCoordinator:
         self._schedule_rx_response(
             self._finalize_pair_ping(
                 msg=msg,
+                session_id=session_id,
+                known=known,
                 src=src,
                 device_type=device_type,
                 firmware=firmware,
@@ -1677,11 +1709,15 @@ class CulMaxCoordinator:
         device_type: int,
         firmware: int,
         serial_str: str,
+        session_id: str | None = None,
+        known: bool | None = None,
     ) -> None:
         """Persist a paired device and notify listeners without blocking RX."""
         try:
             auto_name = _default_device_name(device_type, src, serial_str)
             existing_device = self.get_device(src)
+            known = self.pairing_session.observe(session_id, src,
+                bool(existing_device and existing_device.paired) if known is None else known)
             if (
                 existing_device is not None
                 and existing_device.name.strip()
@@ -1730,13 +1766,18 @@ class CulMaxCoordinator:
                     ],
                 )
 
+            self.pairing_session.record(session_id, src, known)
+            self._notify_pairing_state_updated()
             # Notify platform listeners so they can create new entities.
             self._dispatch(msg, None)
 
             if device_type in CLIMATE_DEVICE_TYPES:
                 await asyncio.sleep(0.5)
                 await self.async_send_time_information(src)
-        except Exception:
+        except Exception as err:
+            if session_id == self.pairing_session.id and src not in self.pairing_session.devices:
+                self.pairing_session.error = str(err)
+                self._notify_pairing_state_updated()
             _LOGGER.exception("Failed to finalize pairing for %s", src)
 
     # ------------------------------------------------------------------

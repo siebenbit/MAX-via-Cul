@@ -32,6 +32,7 @@ from .const import (
 from .coordinator import CulMaxCoordinator
 from .frontend import async_register_frontend
 from .queue_api import CONTROLLERS, SERVICES as QUEUE_SERVICES, register_queue_services
+from .pairing_api import DATA_KEY as PAIRING_DATA_KEY, register_pairing_api
 from .room_config_api import DATA_KEY as ROOM_DATA_KEY, SERVICES as ROOM_SERVICES, register_room_config_api
 
 _LOGGER = logging.getLogger(__name__)
@@ -324,6 +325,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bo
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _register_services(hass, coordinator)
     register_room_config_api(hass)
+    register_pairing_api(hass)
     return True
 
 
@@ -1431,6 +1433,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> b
     coordinator: CulMaxCoordinator = entry.runtime_data
     await coordinator.async_shutdown()
     hass.data.get(CONTROLLERS, {}).pop(entry.entry_id, None)
+    if PAIRING_DATA_KEY in hass.data:
+        hass.data[PAIRING_DATA_KEY].rebind()
     if ROOM_DATA_KEY in hass.data:
         hass.data[ROOM_DATA_KEY].rebind()
     if not hass.data.get(CONTROLLERS):

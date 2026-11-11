@@ -1445,3 +1445,27 @@ Budgetprüfung, nicht die garantierte Sendezeit.
 Frontendtests: `node --experimental-vm-modules --test custom_components/cul_max/tests/frontend/*.test.mjs`.
 Die Browserchecks `check_room_card.py`, `check_queue_card.py` und
 `check_shared_cards.py` starten jeweils einen temporären lokalen HTTP-Server.
+
+### Geräte anlernen mit der Pairing-Karte
+
+Die Karte **MAX! Geräte anlernen** ist im visuellen Karteneditor verfügbar:
+
+```yaml
+type: custom:cul-max-pairing-card
+title: MAX! Geräte anlernen
+duration: 60
+```
+
+Bei mehreren CUL-Anschlüssen zuerst den gewünschten Anschluss auswählen. Mit
+**Pairing starten** das Zeitfenster öffnen und anschließend Pairing am Gerät
+aktivieren. Die Live-Liste zeigt angelernte Thermostate, Fensterkontakte und
+weitere MAX!-Geräte. **Gerät bearbeiten** öffnet die HA-Geräteseite für Name und
+Raum. Änderungen dort erscheinen automatisch in der Karte.
+
+Die Liste bleibt nach Ablauf, Browser-Neuladen und Integration-Reload erhalten;
+ein neuer Pairing-Start ersetzt sie. Beim HA-Neustart wird sie verworfen.
+Pairing wird beim Integration-Reload beendet und nicht automatisch fortgesetzt.
+Auch die bestehende Aktion `cul_max.start_pairing` aktualisiert die Liste.
+Die Karte ist für Administratoren vorgesehen. Optional fixiert `config_entry_id`
+einen CUL-Anschluss; `duration` erlaubt 1 bis 3600 Sekunden (Standard 60).
+Die Karte vergibt keine Namen oder Räume automatisch und erstellt keine Funklinks.

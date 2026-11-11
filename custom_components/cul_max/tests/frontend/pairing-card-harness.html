@@ -1,0 +1,9 @@
+<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+body{font:16px system-ui;background:#eee;margin:24px}cul-max-pairing-card{display:block;max-width:650px;margin:auto}body.dark{--primary-text-color:#eee;--secondary-text-color:#aaa;--card-background-color:#202020;--ha-card-background:#202020;--divider-color:#555;--secondary-background-color:#333;background:#111}
+</style><cul-max-pairing-card></cul-max-pairing-card><script type="module">
+import '../../frontend/cul-max-pairing-card.js?v=fixture';
+window.fixture={controllers:[{config_entry_id:'demo',name:'MAX! CUL',connected:true,session_id:'session',active:true,ends_at:new Date(Date.now()+60000).toISOString(),devices:[{name:'Heizkörperthermostat mit einem langen vollständigen Gerätenamen',device_type:'Heizkörperthermostat',serial_number:'NEQ1234567',device_id:'demo',area_name:null},{name:'Fensterkontakt',device_type:'Fensterkontakt',serial_number:'OEQ7654321',device_id:'window',area_name:'Wohnzimmer',already_known:true}]}]};
+window.card=document.querySelector('cul-max-pairing-card');card.setConfig({});
+window.pushFixture=()=>window.push?.(structuredClone(fixture));
+card.hass={user:{is_admin:true},connection:{addEventListener(){},removeEventListener(){},async subscribeMessage(cb){window.push=cb;pushFixture();return()=>{};}},async callWS(){}};
+</script></html>

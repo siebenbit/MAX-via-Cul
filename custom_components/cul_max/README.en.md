@@ -1042,3 +1042,22 @@ budget check, not a guaranteed send time.
 
 Run frontend tests with `node --experimental-vm-modules --test custom_components/cul_max/tests/frontend/*.test.mjs`.
 Browser checks start an ephemeral local HTTP server automatically.
+
+### Pairing card
+
+Add **MAX! Geräte anlernen** using the visual card picker, or configure:
+
+```yaml
+type: custom:cul-max-pairing-card
+duration: 60
+```
+
+Select a controller if several are loaded, start pairing, then activate pairing
+on the physical device. Live results include thermostats and window contacts.
+**Gerät bearbeiten** opens the HA device page to edit its name and area; registry
+changes appear automatically. Results survive navigation, browser refresh and
+integration reload until the next pairing start or HA restart. Reload ends an
+active window without restarting it. The existing `cul_max.start_pairing` action
+also updates the list. Administrator access is required. Optional `config_entry_id`
+fixes a controller; `duration` accepts 1–3600 seconds, default 60. Names, areas and
+RF peer links are not assigned automatically.
