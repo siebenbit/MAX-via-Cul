@@ -1495,3 +1495,10 @@ Die Sendewarteschlange zeigt den aktuellen HA-Gerätenamen auch für bereits
 wartende Einzel- und Konfigurationsaufträge. Umbenennungen werden automatisch
 übernommen. Ohne HA-Gerätenamen wird der interne Name beziehungsweise die
 Funkadresse verwendet; gespeicherte Befehlsbeschreibungen bleiben unverändert.
+
+### TCP-Verbindungsueberwachung
+
+Nach 60 Sekunden ohne TCP-Empfang prueft die Integration die Verbindung mit einer
+`X`-Budgetabfrage. Bleibt die Antwort drei Sekunden lang aus, wird die Verbindung
+neu aufgebaut. Die Pruefung sendet keine Funkpakete. Verpasste Fenstermeldungen
+werden nicht nachtraeglich rekonstruiert; dafuer ist eine neue Geraetemeldung noetig.

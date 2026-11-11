@@ -1084,3 +1084,10 @@ by this fix.
 The queue displays the current HA device name for existing commands and
 configuration jobs, including subsequent renames. Missing HA names fall back to
 the internal name or radio address. Stored command descriptions remain unchanged.
+
+### TCP connection monitoring
+
+After 60 seconds without TCP reception, the integration probes the connection
+with an `X` credit query. If no reply arrives within three seconds, it reconnects.
+The probe sends no RF packets. Missed window events cannot be reconstructed;
+a new device report is needed to update the contact state.

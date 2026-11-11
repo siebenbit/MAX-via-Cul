@@ -108,6 +108,7 @@ WEEK_PROFILE_PART_DELAY = 0.35
 WEEK_PROFILE_DAY_DELAY = 0.75
 RECONNECT_WAIT_TIMEOUT = 12.0
 CUL_CREDIT_MAX = 900
+CUL_HEARTBEAT_IDLE_SECONDS = 60.0
 CUL_CREDIT_QUERY_TIMEOUT = 3.0
 CUL_CREDIT_RESERVE = 1
 CUL_CREDIT_RETRY_MIN = 5.0
@@ -449,6 +450,8 @@ class CulMaxCoordinator:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._read_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._last_tcp_rx = self.hass.loop.time()
         self._counter: int = 0
         self.pairing_session = PairingSession()
         self._pairing_mode: bool = False
@@ -1011,6 +1014,8 @@ class CulMaxCoordinator:
             self._polling_task = self.hass.loop.create_task(self._periodic_time_sync_loop())
         if self._pending_queue_task is None or self._pending_queue_task.done():
             self._pending_queue_task = self.hass.loop.create_task(self._pending_queue_maintenance_loop())
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = self.hass.loop.create_task(self._heartbeat_loop())
         await self._load_devices()
         await self._ensure_time_slots_assigned()
         if await self._connect():
@@ -1022,6 +1027,10 @@ class CulMaxCoordinator:
     async def async_shutdown(self) -> None:
         """Close the TCP connection cleanly."""
         self._shutting_down = True
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+            self._heartbeat_task = None
         if self._pairing_task:
             self._pairing_task.cancel()
             await asyncio.gather(self._pairing_task, return_exceptions=True)
@@ -1159,6 +1168,7 @@ class CulMaxCoordinator:
             await self._close_connection()
             return False
 
+        self._last_tcp_rx = self.hass.loop.time()
         self._read_task = self.hass.loop.create_task(
             self._read_loop(self._reader, self._connection_generation)
         )
@@ -1225,6 +1235,7 @@ class CulMaxCoordinator:
                 line = line_bytes.decode("ascii", errors="ignore").strip()
                 if not line:
                     continue
+                self._last_tcp_rx = self.hass.loop.time()
                 _LOGGER.debug("CUL RX: %s", line)
                 await self._handle_line(line, generation=generation)
         except asyncio.CancelledError:
@@ -1240,6 +1251,33 @@ class CulMaxCoordinator:
         if generation == self._connection_generation:
             await self._close_connection()
             self._schedule_reconnect()
+
+    async def _heartbeat_loop(self) -> None:
+        """Probe silent TCP connections without sending RF packets."""
+        while not self._shutting_down:
+            delay = max(1.0, self._last_tcp_rx + CUL_HEARTBEAT_IDLE_SECONDS - self.hass.loop.time(),
+                        self._credit_retry_at - self.hass.loop.time())
+            if not self._connection_ready.is_set() or self._reconnecting:
+                delay = max(delay, CUL_HEARTBEAT_IDLE_SECONDS)
+            await asyncio.sleep(delay)
+            await self._check_heartbeat()
+
+    async def _check_heartbeat(self) -> None:
+        generation = self._connection_generation
+        async with self._cul_credit_lock:
+            if (self._shutting_down or self._reconnecting or not self._connection_ready.is_set()
+                    or self._writer is None or generation != self._connection_generation
+                    or self.hass.loop.time() - self._last_tcp_rx < CUL_HEARTBEAT_IDLE_SECONDS
+                    or self.hass.loop.time() < self._credit_retry_at):
+                return
+            _LOGGER.debug("CUL heartbeat after %.1fs without TCP reception",
+                          self.hass.loop.time() - self._last_tcp_rx)
+            try:
+                await self._query_credit()
+            except (TimeoutError, OSError, ConnectionError) as err:
+                # _query_credit owns reconnect. Do not invalidate a newer stream.
+                if self._writer is None and not self._shutting_down:
+                    self._budget_failure(f"TCP heartbeat failed: {str(err) or 'Credit query timed out'}")
 
     async def _reconnect_loop(self) -> None:
         """Keep attempting reconnection until successful."""
@@ -4242,11 +4280,15 @@ class CulMaxCoordinator:
     async def _write_cul(
         self, cmd: str, before_send: Callable[[], str | None] | None = None,
         radio_request: RadioRequest | None = None,
+        expected_generation: int | None = None,
     ) -> None:
         """Write without reading; only the receive loop owns the reader."""
         async with self._send_lock:
+            if expected_generation is not None and expected_generation != self._connection_generation:
+                raise ConnectionError("CUL connection changed before query write")
             if self._writer is None:
                 raise ConnectionError("CUL disconnected")
+            generation = self._connection_generation
             try:
                 if before_send:
                     prepared = before_send()
@@ -4263,21 +4305,24 @@ class CulMaxCoordinator:
                     self._record_radio_write(cmd, radio_request)
                 await self._writer.drain()
             except (OSError, ConnectionError):
-                await self._close_connection()
-                self._schedule_reconnect()
+                if generation == self._connection_generation:
+                    await self._close_connection()
+                    self._schedule_reconnect()
                 raise
 
     async def _query_credit(self) -> int:
         """Called under the credit lock; close ambiguous streams on timeout."""
+        generation = self._connection_generation
         future: asyncio.Future[int] = self.hass.loop.create_future()
         self._credit_response = future
         try:
             async with asyncio.timeout(CUL_CREDIT_QUERY_TIMEOUT):
-                await self._write_cul("X")
+                await self._write_cul("X", expected_generation=generation)
                 return await future
         except (TimeoutError, OSError, ConnectionError):
-            await self._close_connection()
-            self._schedule_reconnect()
+            if generation == self._connection_generation:
+                await self._close_connection()
+                self._schedule_reconnect()
             raise
         finally:
             if not future.done():
