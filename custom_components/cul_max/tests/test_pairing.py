@@ -195,3 +195,52 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.superseded_by, "")
         self.assertEqual(a.duplicate_reason, "")
         self.assertEqual(b.superseded_by, a.address)
+
+    async def test_pair_ping_destination_gate_and_logging(self):
+        for active in (False, True):
+            for dst in (0, self.c.own_address, 0xFEDCBA):
+                with self.subTest(active=active, dst=dst):
+                    self.c._pairing_mode = active
+                    self.c.pairing_session.start(datetime.now(UTC) + timedelta(seconds=60))
+                    self.c.pairing_session.active = active
+                    self.c._handle_pair_ping = AsyncMock()
+                    self.c._schedule_rx_response = lambda coro: asyncio.create_task(coro)
+                    line = f"Z0B010000ABCDEF{dst:06X}0004"
+                    with self.assertLogs(transport.mod.__name__, level="INFO") as logs:
+                        await self.c._handle_line(line)
+                    await self.settle()
+                    self.assertIn(f"partner_address={dst:06X}", logs.output[0])
+                    self.assertEqual(self.c._handle_pair_ping.await_count,
+                                     int(active and dst != 0xFEDCBA))
+                    self.assertEqual(bool(self.c.pairing_session.rejected),
+                                     active and dst == 0xFEDCBA)
+                    self.assertIsNone(self.c.get_device("ABCDEF"))
+
+    async def test_foreign_pair_ping_cannot_send_or_change_existing_device(self):
+        await self.c.async_start_pairing(60)
+        device = transport.mod.KnownDevice("ABCDEF", 1, "Heizung", paired=False)
+        self.c._devices[device.address] = device
+        self.c._send_raw = AsyncMock()
+        self.c._finalize_pair_ping = AsyncMock()
+        msg = transport.protocol.parse_message("Z0B010000ABCDEFFEDCBA0004")
+        await self.c._process_pair_ping(msg, self.c.pairing_session.id)
+        self.c._send_raw.assert_not_awaited()
+        self.c._finalize_pair_ping.assert_not_awaited()
+        self.assertFalse(device.paired)
+
+    async def test_rejections_follow_session_lifecycle(self):
+        session = PairingSession()
+        session.start(datetime.now(UTC))
+        old = session.id
+        session.reject(old, "ABCDEF", "111111")
+        session.reject(old, "ABCDEF", "222222")
+        self.assertEqual(len(session.rejected), 1)
+        self.assertEqual(session.rejected["ABCDEF"]["partner_address"], "222222")
+        session.active = False
+        session.reject(old, "ABCDEF", "333333")
+        self.assertEqual(session.rejected["ABCDEF"]["partner_address"], "222222")
+        session.record(old, "ABCDEF", False)
+        self.assertFalse(session.rejected)
+        session.start(datetime.now(UTC))
+        session.reject(old, "ABCDEF", "111111")
+        self.assertFalse(session.rejected)

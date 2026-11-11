@@ -1490,6 +1490,16 @@ class CulMaxCoordinator:
         decoded: ThermostatState | ShutterContactState | None = None
 
         if msg.msg_type == MSG_PAIR_PING:
+            allowed = msg.dst in (0, self.own_address)
+            _LOGGER.info(
+                "PairPing: device=%s partner_address=%s own_address=%06X decision=%s",
+                msg.src_hex, msg.dst_hex, self.own_address,
+                "foreign_address_rejected" if not allowed else
+                "pairing_allowed" if self._pairing_mode else "pairing_inactive",
+            )
+            if not allowed:
+                self._reject_foreign_pair_ping(msg, self.pairing_session.id)
+                return
             if self._pairing_mode:
                 session_id = self.pairing_session.id
                 known = self.pairing_session.observe(session_id, msg.src_hex,
@@ -1681,6 +1691,12 @@ class CulMaxCoordinator:
         _LOGGER.info("MAX! pairing mode ended")
         self._notify_pairing_state_updated()
 
+    def _reject_foreign_pair_ping(self, msg: MaxMessage, session_id: str | None) -> None:
+        """Publish a foreign PairPing without responding or registering it."""
+        if self._pairing_mode:
+            self.pairing_session.reject(session_id, msg.src_hex, msg.dst_hex)
+            self._notify_pairing_state_updated()
+
     async def _handle_pair_ping(self, msg: MaxMessage, session_id: str | None = None, known: bool | None = None) -> None:
         try:
             await self._process_pair_ping(msg, session_id, known)
@@ -1692,6 +1708,11 @@ class CulMaxCoordinator:
 
     async def _process_pair_ping(self, msg: MaxMessage, session_id: str | None, known: bool | None = None) -> None:
         """Handle a PairPing — respond with PairPong and register the new device."""
+        if msg.dst not in (0, self.own_address):
+            self._reject_foreign_pair_ping(msg, session_id)
+            return
+        if not self._pairing_mode:
+            return
         src = msg.src_hex
         _LOGGER.info("PairPing from new device %s (payload: %s)", src, msg.payload.hex())
 

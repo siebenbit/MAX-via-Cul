@@ -43,10 +43,18 @@ class PairingHub:
                     "device_type": DEVICE_TYPE_NAMES_DE.get(device.device_type, DEFAULT_DEVICE_TYPE_NAME_DE) if device else DEFAULT_DEVICE_TYPE_NAME_DE,
                     "serial_number": device.serial_number if device else None,
                     "area_name": area.name if area else None})
+            rejected = []
+            for result in session.rejected.values():
+                device = c.get_device(result["address"])
+                entry = registry.async_get_device(identifiers={(DOMAIN, result["address"])})
+                rejected.append({**result, "name":
+                    (entry.name_by_user or entry.name) if entry else
+                    device.name if device else result["address"]})
             controllers.append({"config_entry_id": key, "name": f"MAX! CUL ({c.host}:{c.port})",
                 "connected": c._writer is not None, "session_id": session.id,
                 "started_at": session.started_at, "ends_at": session.ends_at,
-                "active": session.active, "devices": devices, "error": session.error})
+                "active": session.active, "devices": devices, "error": session.error,
+                "own_address": f"{c.own_address:06X}", "rejected": rejected})
         return {"controllers": controllers}
 
     @callback

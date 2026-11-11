@@ -1530,3 +1530,15 @@ Es werden keine HA-Räume angelegt, keine Geräte umbenannt und keine bestehende
 Links automatisch entfernt. Raumwechsel eines Geräts löst keine Funkänderung aus.
 Die Gruppen-ID bezeichnet die gespeicherte Zielzuordnung; der Status zeigt, ob die
 Einrichtung nach dem bekannten Integrationszustand vollständig ist.
+
+### Pairing-Adressen erkennen
+
+Jeder empfangene PairPing wird auf INFO-Level mit Geräteadresse,
+Ziel-/bisheriger Partneradresse, eigener Zentralenadresse und Entscheidung
+protokolliert, auch außerhalb eines Pairing-Fensters.
+Nur Anfragen an 000000 oder die eigene Zentralenadresse werden während
+des Pairing-Fensters beantwortet. Andere Zieladressen werden abgelehnt.
+Die Pairing-Karte zeigt die eigene Adresse und solche Ablehnungen mit
+Partneradresse separat an. Kartenergebnisse werden nur während des Fensters
+gesammelt, bleiben danach sichtbar und werden beim nächsten Start gelöscht.
+Eine abgelehnte Anfrage legt kein Gerät an und bestätigt kein Pairing.

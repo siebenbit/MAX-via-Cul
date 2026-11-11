@@ -1112,3 +1112,15 @@ commands can be cancelled through the queue card. After restart, existing deferr
 commands resume, while steps not yet queued require another explicit start.
 No HA areas are created, devices renamed or old links removed automatically.
 Changing an HA area alone does not reconfigure the physical devices.
+
+### Identifying pairing addresses
+
+Every received PairPing is logged at INFO level with the device address,
+destination/previous partner address, own controller address and decision,
+including outside a pairing window.
+Only requests addressed to 000000 or our own controller are answered during
+the pairing window. Other destinations are rejected.
+The pairing card shows our address and rejected requests with their partner
+addresses separately. Card results are collected during the window, retained
+afterwards and cleared on the next start. Rejected requests do not create a
+device or confirm pairing.

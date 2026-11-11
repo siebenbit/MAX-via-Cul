@@ -24,7 +24,7 @@ class PairingHubTests(unittest.TestCase):
             spec.loader.exec_module(api)
         self.api = api
         device = types.SimpleNamespace(name="Thermostat", device_type=1, serial_number="NEQ1234567")
-        self.c = types.SimpleNamespace(pairing_session=transport.mod.PairingSession(), host="cul", port=2323, _writer=object(),
+        self.c = types.SimpleNamespace(pairing_session=transport.mod.PairingSession(), host="cul", port=2323, own_address=0x123456, _writer=object(),
             get_device=lambda address: device, add_pairing_state_listener=lambda cb: Mock())
         self.hass = types.SimpleNamespace(data={api.CONTROLLERS:{"a":self.c}}, bus=types.SimpleNamespace(async_listen=lambda *a:Mock(), async_listen_once=lambda *a:Mock()))
         self.hub = api.PairingHub(self.hass)
@@ -69,3 +69,14 @@ class PairingHubTests(unittest.TestCase):
         self.assertEqual(len(self.hub.snapshot()["controllers"]),2)
         self.hub.close()
         self.assertFalse(self.hub.bindings)
+
+    def test_rejected_snapshot_is_separate_from_successes(self):
+        from datetime import datetime, UTC
+        self.c.pairing_session.start(datetime.now(UTC))
+        self.c.pairing_session.reject(self.c.pairing_session.id, "ABCDEF", "FEDCBA")
+        self.c.get_device = lambda address: None
+        snapshot = self.hub.snapshot()["controllers"][0]
+        self.assertEqual(snapshot["own_address"], "123456")
+        self.assertEqual(snapshot["devices"], [])
+        self.assertEqual(snapshot["rejected"], [{
+            "address": "ABCDEF", "partner_address": "FEDCBA", "name": "ABCDEF"}])

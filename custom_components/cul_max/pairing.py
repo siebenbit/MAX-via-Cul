@@ -11,6 +11,7 @@ class PairingSession:
     ends_at: str | None = None
     active: bool = False
     devices: dict = field(default_factory=dict)
+    rejected: dict = field(default_factory=dict)
     error: str | None = None
     initial_known: dict[str, bool] = field(default_factory=dict)
 
@@ -20,6 +21,7 @@ class PairingSession:
         self.ends_at = until.isoformat()
         self.active = True
         self.devices.clear()
+        self.rejected.clear()
         self.initial_known.clear()
         self.error = None
 
@@ -31,4 +33,12 @@ class PairingSession:
 
     def record(self, session_id, address, known):
         if session_id is not None and session_id == self.id:
+            self.rejected.pop(address, None)
             self.devices.setdefault(address, {"address": address, "already_known": known})
+
+    def reject(self, session_id, address, partner_address):
+        """Retain the latest foreign partner only for the active window."""
+        if self.active and session_id is not None and session_id == self.id:
+            self.rejected[address] = {
+                "address": address, "partner_address": partner_address,
+            }

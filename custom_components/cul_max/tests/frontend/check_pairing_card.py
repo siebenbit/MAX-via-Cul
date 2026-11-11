@@ -12,6 +12,9 @@ with preview_server() as origin, sync_playwright() as p:
     expect(card.get_by_role("heading", name="MAX! Geräte anlernen")).to_be_visible()
     expect(card.get_by_text("Noch keinem Raum zugeordnet")).to_be_visible()
     expect(card.get_by_text("Erneut angelernt", exact=True)).to_be_visible()
+    expect(card.get_by_text("Eigene Zentralenadresse: 123456", exact=True)).to_be_visible()
+    expect(card.get_by_role("heading", name="Pairing abgelehnt")).to_be_visible()
+    expect(card.get_by_text("Gerät ABCDEF · Bisheriger Pairing-Partner: FEDCBA", exact=True)).to_be_visible()
     initial_url = page.url
     card.get_by_role("button", name="Gerät bearbeiten").first.click()
     dialog = page.locator("cul-max-device-dialog")

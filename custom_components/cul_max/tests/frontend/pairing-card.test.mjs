@@ -18,6 +18,14 @@ test('pairing live results, escaping, controller selection and cleanup', async (
   assert.match(card.shadowRoot.innerHTML,/&lt;img&gt;/);
   assert.match(card.shadowRoot.innerHTML,/data-edit="abc"/);
   assert.doesNotMatch(card.shadowRoot.innerHTML,/href="\/config\/devices/);
+  c.own_address = '123456';
+  c.rejected = [{address:'ABCDEF', partner_address:'FEDCBA', name:'<rejected>'}];
+  push({controllers:[c]});
+  assert.match(card.shadowRoot.innerHTML, /Eigene Zentralenadresse: 123456/);
+  assert.match(card.shadowRoot.innerHTML, /Pairing abgelehnt/);
+  assert.match(card.shadowRoot.innerHTML, /Bisheriger Pairing-Partner: FEDCBA/);
+  assert.match(card.shadowRoot.innerHTML, /&lt;rejected&gt;/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /<rejected>/);
   await card._start(); assert.equal(calls[0].config_entry_id,'a'); assert.equal(calls[0].duration,60);
   push({controllers:[c,{...c,config_entry_id:'b'}]});
   assert.equal(card._controller(),null);
