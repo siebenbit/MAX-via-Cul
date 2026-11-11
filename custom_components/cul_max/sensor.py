@@ -573,6 +573,36 @@ class CulMaxPeersSensor(SensorEntity):
         }
 
 
+class CulMaxGroupIdSensor(SensorEntity):
+    """Expose the known MAX! RF group directly in device diagnostics."""
+
+    _attr_has_entity_name = True
+    _attr_name = "MAX!-Funkgruppe"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:group"
+
+    def __init__(self, coordinator: CulMaxCoordinator, device: KnownDevice) -> None:
+        self._coordinator = coordinator
+        self._device = device
+        self._attr_unique_id = f"{DOMAIN}_{device.address}_group_id"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device.address)}, name=device.name,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._coordinator.add_diagnostic_listener(
+            self._device.address, self.async_write_ha_state,
+        ))
+
+    @property
+    def native_value(self) -> int | str:
+        return self._device.group_id if self._device.group_id else "Keine Gruppe"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, int]:
+        return {"group_id": self._device.group_id}
+
+
 class CulMaxExpectedWeekProfileTemperatureSensor(SensorEntity):
     """Current target temperature derived from the stored week profile."""
 
@@ -707,6 +737,7 @@ def _build_diagnostic_entities(
         CulMaxIdentitySensor(coordinator, device),
         CulMaxPairingStateSensor(coordinator, device),
         CulMaxPeersSensor(coordinator, device),
+        CulMaxGroupIdSensor(coordinator, device),
         CulMaxLastSeenSensor(coordinator, device),
         CulMaxLastAckSensor(coordinator, device),
         CulMaxLastCommandSuccessSensor(coordinator, device),

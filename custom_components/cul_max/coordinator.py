@@ -2792,6 +2792,7 @@ class CulMaxCoordinator:
             await self._set_last_command(address, f"SetGroupId {group_id} [virtual]")
             await self._mark_command_success(address, retries=0, ack_at=None)
             await self._save_devices()
+            self._notify_diagnostics_updated(address)
             _LOGGER.info("SetGroupId → %s: %d (virtual/local only)", self.format_device_label(address), group_id)
             return
 
@@ -2824,6 +2825,7 @@ class CulMaxCoordinator:
             )
         device.group_id = group_id
         await self._save_devices()
+        self._notify_diagnostics_updated(address)
 
     async def async_remove_group_id(self, address: str) -> None:
         """Remove a MAX! group ID from one device."""
@@ -2837,6 +2839,7 @@ class CulMaxCoordinator:
             await self._set_last_command(address, "RemoveGroupId [virtual]")
             await self._mark_command_success(address, retries=0, ack_at=None)
             await self._save_devices()
+            self._notify_diagnostics_updated(address)
             _LOGGER.info("RemoveGroupId → %s (virtual/local only)", self.format_device_label(address))
             return
 
@@ -2868,6 +2871,7 @@ class CulMaxCoordinator:
             )
         device.group_id = 0
         await self._save_devices()
+        self._notify_diagnostics_updated(address)
 
     async def async_add_link_partner(self, address: str, partner_address: str) -> None:
         """Link one MAX! device to another device on-device."""

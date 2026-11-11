@@ -20,6 +20,32 @@ climate = debounce.climate
 BASE = Path(__file__).parents[1]
 
 
+def load_sensors():
+    # Load only HA's entity surfaces; exercise the real sensor implementation.
+    modules = {name: types.ModuleType(name) for name in (
+        "homeassistant", "homeassistant.components", "homeassistant.components.sensor",
+        "homeassistant.const", "homeassistant.core", "homeassistant.helpers",
+        "homeassistant.helpers.entity", "homeassistant.helpers.entity_platform",
+        "homeassistant.helpers.event", "homeassistant.util", "homeassistant.util.dt")}
+    modules["homeassistant.util.dt"].parse_datetime = lambda value: datetime.fromisoformat(value) if value else None
+    sensor_api = modules["homeassistant.components.sensor"]
+    sensor_api.SensorEntity = object
+    sensor_api.SensorDeviceClass = types.SimpleNamespace(TIMESTAMP="timestamp")
+    sensor_api.SensorStateClass = types.SimpleNamespace(MEASUREMENT="measurement", TOTAL_INCREASING="total_increasing")
+    modules["homeassistant.const"].UnitOfTemperature = types.SimpleNamespace(CELSIUS="°C")
+    modules["homeassistant.const"].EntityCategory = types.SimpleNamespace(DIAGNOSTIC="diagnostic")
+    modules["homeassistant.core"].HomeAssistant = object
+    modules["homeassistant.core"].callback = lambda func: func
+    modules["homeassistant.helpers.entity"].DeviceInfo = lambda **kwargs: kwargs
+    modules["homeassistant.helpers.entity_platform"].AddEntitiesCallback = object
+    modules["homeassistant.helpers.event"].async_track_time_interval = lambda *args: None
+    with patch.dict(sys.modules, modules):
+        spec = importlib.util.spec_from_file_location("_cul_budget_tests.sensor", BASE / "sensor.py")
+        sensors = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sensors)
+    return sensors
+
+
 class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = debounce.DebounceTests.asyncSetUp
     asyncTearDown = debounce.DebounceTests.asyncTearDown
@@ -839,27 +865,7 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("valve_position", self.display()["reported"])
 
     async def test_valve_sensor_keeps_real_zero_and_report_timestamp(self):
-        # Load only HA's entity surfaces; exercise the real sensor implementation.
-        modules = {name: types.ModuleType(name) for name in (
-            "homeassistant", "homeassistant.components", "homeassistant.components.sensor",
-            "homeassistant.const", "homeassistant.core", "homeassistant.helpers",
-            "homeassistant.helpers.entity", "homeassistant.helpers.entity_platform",
-            "homeassistant.helpers.event", "homeassistant.util", "homeassistant.util.dt")}
-        sensor_api = modules["homeassistant.components.sensor"]
-        sensor_api.SensorEntity = object
-        sensor_api.SensorDeviceClass = types.SimpleNamespace(TIMESTAMP="timestamp")
-        sensor_api.SensorStateClass = types.SimpleNamespace(MEASUREMENT="measurement", TOTAL_INCREASING="total_increasing")
-        modules["homeassistant.const"].UnitOfTemperature = types.SimpleNamespace(CELSIUS="°C")
-        modules["homeassistant.const"].EntityCategory = types.SimpleNamespace(DIAGNOSTIC="diagnostic")
-        modules["homeassistant.core"].HomeAssistant = object
-        modules["homeassistant.core"].callback = lambda func: func
-        modules["homeassistant.helpers.entity"].DeviceInfo = lambda **kwargs: kwargs
-        modules["homeassistant.helpers.entity_platform"].AddEntitiesCallback = object
-        modules["homeassistant.helpers.event"].async_track_time_interval = lambda *args: None
-        with patch.dict(sys.modules, modules):
-            spec = importlib.util.spec_from_file_location("_cul_budget_tests.sensor", BASE / "sensor.py")
-            sensors = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(sensors)
+        sensors = load_sensors()
         sensor = sensors.CulMaxValvePositionSensor(self.c, self.c.get_device("123456"))
         self.assertIsNone(sensor.native_value)
         await self.report(22, valve=0)
@@ -868,6 +874,39 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(timestamp)
         await self.report(payload=bytes([0, 1, 40]), kind=0x70)
         self.assertEqual(sensor.extra_state_attributes["last_reported_at"], timestamp)
+
+    async def test_group_sensor_updates_after_assignment_and_removal(self):
+        sensors = load_sensors()
+        device = self.c.get_device("123456")
+        device.group_id = 0
+        sensor = sensors.CulMaxGroupIdSensor(self.c, device)
+        self.assertEqual(sensor.native_value, "Keine Gruppe")
+        self.assertEqual(sensor.extra_state_attributes, {"group_id": 0})
+        self.assertEqual(sensor._attr_entity_category, "diagnostic")
+        self.assertEqual(sensor._attr_unique_id, "cul_max_123456_group_id")
+        self.assertEqual(sum(isinstance(item, sensors.CulMaxGroupIdSensor)
+                             for item in sensors._build_diagnostic_entities(self.c, device)), 1)
+        writes, removers = [], []
+        sensor.async_write_ha_state = lambda: writes.append(sensor.native_value)
+        sensor.async_on_remove = removers.append
+        await sensor.async_added_to_hass()
+        try:
+            with patch.object(self.c, "_prepare_device_for_config", new=AsyncMock()), \
+                    patch.object(self.c, "_send_command", new=AsyncMock()):
+                for group_id in (1, 255):
+                    await self.c.async_set_group_id(device.address, group_id)
+                    await self.settle()
+                    self.assertEqual(writes[-1], group_id)
+                    self.assertEqual(sensor.extra_state_attributes["group_id"], group_id)
+                await self.c.async_remove_group_id(device.address)
+                await self.settle()
+                self.assertEqual(writes[-1], "Keine Gruppe")
+            await mod.CulMaxCoordinator._update_device_group(self.c, device.address, 7)
+            await self.settle()
+            self.assertEqual(writes[-1], 7)
+        finally:
+            for remove in removers:
+                remove()
 
     async def test_native_temperature_api_avoids_all_deprecated_temperature_members(self):
         native = debounce.load_climate(native=True)
