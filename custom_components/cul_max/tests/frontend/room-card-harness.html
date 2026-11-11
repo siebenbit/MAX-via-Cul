@@ -6,9 +6,10 @@
 body{margin:20px;font:16px system-ui;background:var(--secondary-background-color);color:var(--primary-text-color)}cul-max-room-config-card{display:block;max-width:960px;margin:auto}
 body.dark{--primary-text-color:#e5e9eb;--secondary-text-color:#b1b8bd;--primary-color:#70b5cd;--secondary-background-color:#141b20;--divider-color:#3b464f;--error-color:#ffb4ab;--card-background-color:#202a32}
 </style>
-<script src="../../frontend/cul-max-room-config-card.js"></script>
+<script type="module" src="../../frontend/cul-max-room-config-card.js"></script>
 <cul-max-room-config-card></cul-max-room-config-card>
-<script>
+<script type="module">
+await customElements.whenDefined("cul-max-room-config-card");
 function makeRoom(id,name){
  const week=Object.fromEntries(['monday','tuesday','wednesday','thursday','friday','saturday','sunday'].map(day=>[day,'17,06:00,21,09:00,18,17:00,21,22:00,17']));
  const values={comfort_temperature:21,eco_temperature:17,window_open_temperature:12,window_open_duration:15,week_profile:week};
@@ -16,9 +17,10 @@ function makeRoom(id,name){
   devices:[{name:'Heizkörper links',address:'123456',config_entry_id:'cul',paired:true,confirmed:structuredClone(values),values:structuredClone(values),draft_blocks:[],jobs:[]},
    {name:'Wandthermostat',address:'234567',config_entry_id:'cul',paired:true,confirmed:structuredClone(values),values:structuredClone(values),draft_blocks:[],jobs:[]}]};
 }
-var rooms=[makeRoom('living','Wohnzimmer'),makeRoom('bed','Schlafzimmer')],calls=[],listeners=new Map(),push,failNext=false;
-var card=document.querySelector('cul-max-room-config-card');
-var hass={user:{is_admin:true},connection:{subscribeMessage:async callback=>{push=callback;queueMicrotask(()=>callback({rooms:structuredClone(rooms)}));return()=>{};},addEventListener:(name,cb)=>listeners.set(name,cb),removeEventListener:name=>listeners.delete(name)},
+window.rooms=[makeRoom('living','Wohnzimmer'),makeRoom('bed','Schlafzimmer')];
+window.calls=[]; window.listeners=new Map(); let push; window.failNext=false;
+window.card=document.querySelector('cul-max-room-config-card');
+window.hass={user:{is_admin:true},connection:{subscribeMessage:async callback=>{push=callback;queueMicrotask(()=>callback({rooms:structuredClone(rooms)}));return()=>{};},addEventListener:(name,cb)=>listeners.set(name,cb),removeEventListener:name=>listeners.delete(name)},
  callWS:async call=>{calls.push(call);if(failNext){failNext=false;throw Error('Konfiguration wurde zwischenzeitlich geändert. Bitte neu laden.');}
   const room=rooms.find(r=>r.id===call.service_data.area_id)||rooms[0];
   if(call.service==='save_room_config'){

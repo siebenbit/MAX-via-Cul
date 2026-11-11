@@ -1,0 +1,8 @@
+<!doctype html><html lang="de"><meta charset="utf-8"><title>MAX! Wochenprofil</title>
+<style>body{margin:16px;font:16px system-ui;background:#f2f5f6}cul-max-week-profile-card{display:block;max-width:760px;margin:auto}</style>
+<script type="module">
+await import("../../frontend/cul-max-week-profile-card.js");
+const card=document.createElement("cul-max-week-profile-card");document.body.append(card);
+card.setConfig({entity:"climate.demo"});
+card.hass={states:{"climate.demo":{state:"auto",attributes:{address:"123456",pairing_state:"paired",friendly_name:"Wohnzimmer",...Object.fromEntries(["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].map(d=>["week_profile_"+d,"17,06:00,21,22:00,17"]))}}}};
+</script><body></body></html>

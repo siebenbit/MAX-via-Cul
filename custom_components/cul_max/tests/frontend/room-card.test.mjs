@@ -1,3 +1,4 @@
+import { loadCard } from "./module-loader.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
@@ -9,7 +10,7 @@ function sample(id = "living", name = "Wohnzimmer") {
   return { id, name, values, revision: { temperature: "t1", week_profile: "w1" }, mixed: [], locks: { temperature: false, week_profile: false }, has_draft: false,
     devices: [{ address: "123456", name: "Thermostat A", config_entry_id: "cul", paired: true, confirmed: structuredClone(values), values: structuredClone(values), jobs: [], draft_blocks: [] }] };
 }
-function setup() {
+async function setup() {
   const elements = new Map();
   class Element {
     constructor() { this.isConnected = true; }
@@ -19,9 +20,9 @@ function setup() {
   }
   let confirmed = true;
   const context = vm.createContext({ HTMLElement: Element, window: { customCards: [], confirm: () => confirmed, addEventListener() {}, removeEventListener() {} },
-    customElements: { get: (name) => elements.get(name), define: (name, el) => elements.set(name, el) }, document: { createElement: (name) => new (elements.get(name))() }, CustomEvent: class {}, console });
-  vm.runInContext(readFileSync(new URL("../../frontend/cul-max-room-config-card.js", import.meta.url), "utf8"), context);
-  const Profile = vm.runInContext("CulMaxRoomProfile", context);
+    customElements: { get: (name) => elements.get(name), define: (name, el) => elements.set(name, el) }, document: { createElement: (name) => new (elements.get(name))() }, CustomEvent: class {}, URL, console });
+  const namespace = await loadCard(new URL("../../frontend/cul-max-room-config-card.js", import.meta.url), context, "\nexport { CulMaxRoomProfile };");
+  const Profile = namespace.CulMaxRoomProfile;
   const card = new (elements.get("cul-max-room-config-card"))();
   const calls = [], events = new Map();
   const rooms = [sample(), sample("bed", "Schlafzimmer")];
@@ -39,8 +40,8 @@ function setup() {
 }
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 
-test("profile round trips, five-minute times and all 13 boundaries are validated", () => {
-  const { Profile } = setup();
+test("profile round trips, five-minute times and all 13 boundaries are validated", async () => {
+  const { Profile } = await setup();
   const raw = "17,06:00,21,09:00,18,17:00,21,22:00,17";
   assert.equal(Profile.serialize(Profile.parse(raw)), raw);
   for (const rows of [[{ time: "00:00", temperature: 18.2 }], [{ time: "00:01", temperature: 20 }],
@@ -53,7 +54,7 @@ test("profile round trips, five-minute times and all 13 boundaries are validated
 });
 
 test("room and day controls render escaped data without polling on hass state changes", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.rooms[0].name = "<script>Wohnzimmer</script>"; env.push();
   assert.match(env.card.shadowRoot.innerHTML, /&lt;script&gt;/);
   assert.match(env.card.shadowRoot.innerHTML, /Komforttemperatur/);
@@ -65,7 +66,7 @@ test("room and day controls render escaped data without polling on hass state ch
 });
 
 test("editing emits no calls; one Save includes temperature and profile changes", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._edit("comfort_temperature", "22");
   env.card._editRows(env.Profile.parse("19,06:00,22"));
   assert.equal(env.calls.length, 0);
@@ -78,7 +79,7 @@ test("editing emits no calls; one Save includes temperature and profile changes"
 });
 
 test("copy only replaces selected targets, preserves other drafts and deep clones rows", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._editRows(env.Profile.parse("19,06:00,22"));
   env.card._day = "sunday";
   env.card._editRows(env.Profile.parse("23"));
@@ -97,7 +98,7 @@ test("copy only replaces selected targets, preserves other drafts and deep clone
 });
 
 test("copy requires targets and respects locks and invalid input", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._copyDay();
   assert.equal(env.card._changes.week_profile, undefined);
   env.card._copyTargets.add("tuesday");
@@ -111,7 +112,7 @@ test("copy requires targets and respects locks and invalid input", async () => {
 });
 
 test("reverting a day removes its draft and copying identical rows creates no change", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   const original = env.Profile.parse(env.rooms[0].values.week_profile.monday);
   env.card._editRows(env.Profile.parse("19"));
   assert.match(env.card._dayLabel("monday"), /ungespeicherte Änderungen/);
@@ -126,7 +127,7 @@ test("reverting a day removes its draft and copying identical rows creates no ch
 
 test("invalid legacy day drafts can be corrected, copied over and saved", async () => {
   for (const invalid of ["ungueltig", "17,06:01,21", "17,06:00,"]) {
-    const env = setup(); await tick();
+    const env = await setup(); await tick();
     env.rooms[0].values.week_profile.monday = invalid;
     env.rooms[0].values.week_profile.wednesday = invalid;
     env.push();
@@ -145,7 +146,7 @@ test("invalid legacy day drafts can be corrected, copied over and saved", async 
 });
 
 test("block locks and external conflicts preserve edits and block saving", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.rooms[0].locks.temperature = true; env.push();
   assert.equal(env.card._locked("temperature"), true);
   assert.equal(env.card._locked("week_profile"), false);
@@ -158,7 +159,7 @@ test("block locks and external conflicts preserve edits and block saving", async
 });
 
 test("room changes confirm discarding and missing room never silently chooses another", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._edit("eco_temperature", "18");
   env.setConfirm(false); env.card._selectRoom("bed");
   assert.equal(env.card._area, "living");
@@ -168,7 +169,7 @@ test("room changes confirm discarding and missing room never silently chooses an
 });
 
 test("save failures keep drafts and reuse the operation ID for retry", async () => {
-  const env = setup(); await tick(); env.failSave();
+  const env = await setup(); await tick(); env.failSave();
   env.card._edit("eco_temperature", "18");
   await env.card._save();
   assert.equal(env.card._changes.eco_temperature, "18");
@@ -179,7 +180,7 @@ test("save failures keep drafts and reuse the operation ID for retry", async () 
 });
 
 test("reconnect subscribes again, detach cleans up, read-only clients receive explanation", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.events.get("disconnected")();
   assert.equal(env.card._online, false);
   env.events.get("ready")(); await tick();
@@ -193,7 +194,7 @@ test("reconnect subscribes again, detach cleans up, read-only clients receive ex
 });
 
 test("empty queue, mixed values and completed or failed jobs render safely", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.rooms[0].values.eco_temperature = null; env.rooms[0].mixed = ["eco_temperature"];
   env.rooms[0].devices[0].jobs = [{ id: "j", block: "temperature", status: "queued", confirmed_steps: [], steps: ["s"], last_error: "Kein ACK <error>" }];
   env.push();
@@ -204,8 +205,8 @@ test("empty queue, mixed values and completed or failed jobs render safely", asy
   assert.match(env.card.shadowRoot.innerHTML, /Keine MAX!-Thermostate/);
 });
 
-test("visual editor exists and has title and initial room configuration", () => {
-  const env = setup();
+test("visual editor exists and has title and initial room configuration", async () => {
+  const env = await setup();
   const editor = new (env.elements.get("cul-max-room-config-card-editor"))();
   editor.setConfig({ title: "Raum & Plan" });
   assert.match(editor.innerHTML, /Raum &amp; Plan/);
@@ -213,7 +214,7 @@ test("visual editor exists and has title and initial room configuration", () => 
 });
 
 test("accepted operations report final confirmation only when all jobs complete", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._lastOperation = "op"; env.card._lastOperationCount = 2;
   const job = { id: "j1", block: "temperature", operation_id: "op", status: "completed", confirmed_steps: ["s"], steps: ["s"] };
   env.rooms[0].devices[0].jobs = [job]; env.push();
@@ -225,7 +226,7 @@ test("accepted operations report final confirmation only when all jobs complete"
 });
 
 test("native time fields use five-minute steps and device template control is absent", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   assert.match(env.card.shadowRoot.innerHTML, /type="time" min="00:00" max="23:55" step="300"/);
   assert.doesNotMatch(env.card.shadowRoot.innerHTML, /data-template|Tagesprofil von einem Raumgerät/);
   env.card._copyOpen = true; env.card._render();
@@ -236,7 +237,7 @@ test("native time fields use five-minute steps and device template control is ab
 });
 
 test("a removed selected room keeps its draft and cannot save into another room", async () => {
-  const env = setup(); await tick();
+  const env = await setup(); await tick();
   env.card._edit("eco_temperature", "18");
   env.rooms.splice(0, 1); env.push();
   assert.equal(env.card._area, "living");

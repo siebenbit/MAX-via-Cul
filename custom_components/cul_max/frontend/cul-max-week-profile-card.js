@@ -1,4 +1,6 @@
+const { cardStyles } = await import(new URL("./cul-max-card-styles.js" + new URL(import.meta.url).search, import.meta.url));
 class CulMaxWeekProfileCard extends HTMLElement {
+  constructor() { super(); this.attachShadow({mode: "open"}); }
   static _isCulMaxClimate(entityId, state) {
     const attrs = state?.attributes || {};
     return (
@@ -36,7 +38,7 @@ class CulMaxWeekProfileCard extends HTMLElement {
               show_current_temp: true,
               ...config,
             };
-            this.innerHTML = "<div style='padding:8px 0'>Editor wird geladen ...</div>";
+            this.shadowRoot.innerHTML = "<div style='padding:8px 0'>Editor wird geladen ...</div>";
           }
         }
       );
@@ -144,16 +146,16 @@ class CulMaxWeekProfileCard extends HTMLElement {
     }
     const stateObj = this._hass.states[this._config.entity];
     if (!stateObj) {
-      this.innerHTML = `
-        <ha-card>
+      this.shadowRoot.innerHTML = `
+        <style>${cardStyles}</style><ha-card>
           <div class="card-content">Entität nicht gefunden: ${this._config.entity}</div>
         </ha-card>
       `;
       return;
     }
     if (!CulMaxWeekProfileCard._isCulMaxClimate(this._config.entity, stateObj)) {
-      this.innerHTML = `
-        <ha-card>
+      this.shadowRoot.innerHTML = `
+        <style>${cardStyles}</style><ha-card>
           <div class="card-content" style="padding:16px">
             <div style="font-weight:600; margin-bottom:8px;">Inkompatible Entität</div>
             <div style="line-height:1.5;">
@@ -207,8 +209,8 @@ class CulMaxWeekProfileCard extends HTMLElement {
       subtitle.push(`Soll ${attrs.temperature} °C`);
     }
 
-    this.innerHTML = `
-      <ha-card>
+    this.shadowRoot.innerHTML = `
+      <style>${cardStyles}</style><ha-card>
         <div class="wrapper">
           <div class="header">
             <div>
@@ -223,34 +225,6 @@ class CulMaxWeekProfileCard extends HTMLElement {
       <style>
         ha-card {
           cursor: pointer;
-        }
-        .wrapper {
-          padding: 16px;
-        }
-        .header {
-          display: flex;
-          justify-content: space-between;
-          align-items: flex-start;
-          gap: 12px;
-          margin-bottom: 14px;
-        }
-        .title {
-          font-size: 1.1rem;
-          font-weight: 600;
-          line-height: 1.2;
-        }
-        .subtitle {
-          margin-top: 4px;
-          color: var(--secondary-text-color);
-          font-size: 0.92rem;
-        }
-        .badge {
-          white-space: nowrap;
-          border-radius: 999px;
-          padding: 4px 10px;
-          background: var(--secondary-background-color);
-          font-size: 0.85rem;
-          color: var(--primary-text-color);
         }
         .grid {
           display: grid;
@@ -302,7 +276,7 @@ class CulMaxWeekProfileCard extends HTMLElement {
       </style>
     `;
 
-    this.querySelector("ha-card")?.addEventListener("click", () => {
+    this.shadowRoot.querySelector("ha-card")?.addEventListener("click", () => {
       this.dispatchEvent(
         new CustomEvent("hass-more-info", {
           bubbles: true,

@@ -1023,3 +1023,22 @@ A matching ACK retains priority over conflicting reports received between handof
 and ACK. ACK knowledge remains in memory; after restart, device reports correct
 the fields they contain. Status attributes describe the last HA request, not
 necessarily its current agreement with the device.
+
+### Shared card styles and queue display
+
+All three cards load a shared versioned style module. Start
+`./start-card-preview.sh` and select a harness at
+`http://127.0.0.1:8765/tests/frontend/`. HTTP is required; opening fixture files
+directly is no longer supported. Manually copied cards also require
+`cul-max-card-styles.js` alongside them; prefer registered `/cul-max/` resources.
+
+The queue displays active jobs first, then the next planned dispatch, followed
+by remaining jobs in admission-time order. Times use HA's configured time zone.
+The additive controller field `next_dispatch` contains `entry_id` and `job_id`,
+or `null`. It describes the current scheduler snapshot, not a guaranteed global
+completion order. Expand Radio details for last reported credits, query time,
+required credits including reserve and errors. The countdown targets the next
+budget check, not a guaranteed send time.
+
+Run frontend tests with `node --experimental-vm-modules --test custom_components/cul_max/tests/frontend/*.test.mjs`.
+Browser checks start an ephemeral local HTTP server automatically.

@@ -4068,6 +4068,11 @@ class CulMaxCoordinator:
                 job["status"] = active.status
                 job["attempts"] = active.attempts
             job["cancellable"] = False
+        radio = self._next_radio_request()
+        entry = (radio.entry if radio and not radio.written else
+                 self._command_queue.peek_ready() if radio is None else None)
+        snapshot["next_dispatch"] = ({"entry_id": entry.id, "job_id": entry.job_id}
+                                     if entry is not None else None)
         snapshot["budget"] = self.get_budget_diagnostics()
         return snapshot
 

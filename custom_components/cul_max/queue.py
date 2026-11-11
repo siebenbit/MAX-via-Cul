@@ -126,14 +126,13 @@ class CommandQueueManager:
         while True:
             self._ready.clear()
             now = self.now()
-            deadlines = []
-            for key, entry in self._pending.items():
-                if (entry.ready_task is None or entry.ready_task.done()
-                        or entry.ready_deadline is None or now >= entry.ready_deadline):
-                    self._pending.pop(key)
-                    self._remove_readiness_callback(entry)
-                    return entry.payload
-                deadlines.append(entry.ready_deadline)
+            entry = self.peek_ready()
+            if entry is not None:
+                self._pending.pop(entry.id)
+                self._remove_readiness_callback(entry)
+                return entry.payload
+            deadlines = [entry.ready_deadline for entry in self._pending.values()
+                         if entry.ready_deadline is not None]
             if not deadlines:
                 await self._ready.wait()
             else:
@@ -141,6 +140,13 @@ class CommandQueueManager:
                     await asyncio.wait_for(self._ready.wait(), max(0, min(deadlines) - now))
                 except TimeoutError:
                     pass
+
+    def peek_ready(self):
+        """Return the next eligible worker entry without consuming it."""
+        now = self.now()
+        return next((entry for entry in self._pending.values()
+                     if entry.ready_task is None or entry.ready_task.done()
+                     or entry.ready_deadline is None or now >= entry.ready_deadline), None)
 
     def _remove_readiness_callback(self, entry: QueueEntry) -> None:
         if entry.ready_task is not None and entry.ready_callback is not None:

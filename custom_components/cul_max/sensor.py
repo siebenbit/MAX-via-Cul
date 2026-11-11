@@ -65,6 +65,7 @@ class CulMaxQueueSensor(SensorEntity):
         self._attr_unique_id = f"{DOMAIN}_{entry_id}_queue"
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, f"controller_{coordinator.host}:{coordinator.port}")})
         self._update_handle = None
+        self._budget_revision = 0
 
     @property
     def native_value(self):
@@ -75,6 +76,7 @@ class CulMaxQueueSensor(SensorEntity):
         data = self._coordinator.get_queue()
         return {"cul_max_queue": True, "config_entry_id": self._entry_id,
                 "session_id": data["session_id"], "revision": data["revision"],
+                "budget_revision": self._budget_revision,
                 "active": data["active"], "superseded_count": data["superseded_count"],
                 "cancelled_count": data["cancelled_count"], "last_queue_error": data["last_error"],
                 "configuration_jobs": sum(job["status"] not in {"completed", "cancelled", "failed"} for job in data["jobs"]),
@@ -82,7 +84,13 @@ class CulMaxQueueSensor(SensorEntity):
 
     async def async_added_to_hass(self):
         self.async_on_remove(self._coordinator.add_queue_listener(self._changed))
+        self.async_on_remove(self._coordinator.add_budget_listener(self._budget_changed))
         self.async_on_remove(self._cancel_update)
+
+    @callback
+    def _budget_changed(self):
+        self._budget_revision += 1
+        self._changed()
 
     @callback
     def _cancel_update(self):

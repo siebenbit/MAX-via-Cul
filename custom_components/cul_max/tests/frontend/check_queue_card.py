@@ -4,18 +4,31 @@ Run manually: python3 custom_components/cul_max/tests/frontend/check_queue_card.
 Playwright is a development tool only, not an integration requirement.
 """
 from pathlib import Path
+from preview_server import preview_server
 from playwright.sync_api import sync_playwright, expect
 
 fixture = Path(__file__).with_name("queue-card-harness.html").resolve().as_uri()
-with sync_playwright() as p:
+with preview_server() as origin, sync_playwright() as p:
     browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
     page = browser.new_page(viewport={"width": 1000, "height": 1000})
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(fixture)
+    page.goto(origin + "/tests/frontend/queue-card-harness.html")
     card = page.locator("cul-max-queue-card")
     expect(card.get_by_text("Solltemperatur → 23 °C", exact=True)).to_be_visible()
     expect(card.get_by_role("button", name="Nicht löschbar")).to_be_disabled()
+    page.evaluate("""controller.next_dispatch={entry_id:'temp',job_id:null};
+      controller.budget.waiting_for_budget=true;
+      controller.budget.next_attempt_at=new Date(Date.now()+60000).toISOString();
+      card._refresh();""")
+    expect(card.get_by_text("Als Nächstes vorgesehen", exact=True)).to_be_visible()
+    expect(card.locator("[data-budget-until]")).to_contain_text("Nächste Budgetprüfung in")
+    card.get_by_text("Funkdetails", exact=True).click()
+    page.evaluate("card._refresh()")
+    expect(card.locator("details[data-preserve=budget]")).to_have_attribute("open", "")
+    page.evaluate("controller.budget.next_attempt_at=new Date(Date.now()-1000).toISOString(); card._refresh()")
+    expect(card.locator("[data-budget-until]")).to_have_text("Budgetprüfung ausstehend")
+    page.evaluate("resetFixture()")
     page.evaluate("controller.entries[0].status='debouncing'; controller.entries[0].debounce_until=new Date(Date.now()+2000).toISOString(); card._refresh()")
     expect(card.get_by_text("Wird gesammelt", exact=False)).to_be_visible()
     countdown = card.locator("[data-debounce-until]")
@@ -43,10 +56,10 @@ with sync_playwright() as p:
     page.once("dialog", lambda dialog: dialog.accept())
     card.get_by_role("button", name="Wartende Befehle leeren").click()
     expect(card.get_by_text("Solltemperatur → 23 °C", exact=True)).to_have_count(0)
-    expect(card.get_by_text("Wochenprofil Montag", exact=True)).to_be_visible()
+    expect(card.get_by_text("Wochenplan", exact=True)).to_be_visible()
     page.once("dialog", lambda dialog: dialog.accept())
     card.get_by_role("button", name="Auftrag abbrechen").click()
-    expect(card.get_by_text("Wochenprofil Montag", exact=True)).to_have_count(0)
+    expect(card.get_by_text("Wochenplan", exact=True)).to_have_count(0)
     page.evaluate("emptyFixture()")
     expect(card.get_by_text("Keine wartenden Aufträge", exact=True)).to_be_visible()
     page.evaluate("resetFixture(); document.body.classList.add('dark')")

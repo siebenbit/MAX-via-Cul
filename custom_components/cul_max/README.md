@@ -1423,3 +1423,25 @@ Ein passendes ACK behält Vorrang vor widersprechenden Meldungen zwischen Versan
 und ACK. ACK-Wissen bleibt im Arbeitsspeicher; nach einem Neustart korrigieren
 Gerätemeldungen die enthaltenen Felder. Statusattribute beschreiben den letzten
 HA-Auftrag, nicht zwingend die aktuelle Übereinstimmung mit dem Gerät.
+
+### Gemeinsame Kartenstyles und Warteschlangenanzeige
+
+Alle drei Karten laden ihre gemeinsamen Styles als versioniertes Modul. Für die
+lokale Vorschau `./start-card-preview.sh` starten und unter
+`http://127.0.0.1:8765/tests/frontend/` eine Harness-Seite auswählen.
+Die Vorschau benötigt HTTP; direktes Öffnen der HTML-Dateien wird nicht unterstützt.
+Manuell kopierte Karten benötigen auch `cul-max-card-styles.js` im gleichen Ordner;
+empfohlen sind die automatisch registrierten Ressourcen unter `/cul-max/`.
+
+Die Warteschlange zeigt laufende Aufträge zuerst, danach den als Nächstes
+vorgesehenen Versand und die übrigen Aufträge nach Einreihzeit. Die Zeitangaben
+verwenden die HA-Zeitzone. `get_queue` enthält pro Controller
+`next_dispatch` mit `entry_id` und `job_id` oder `null`; dies ist eine
+Momentaufnahme und keine garantierte Gesamtreihenfolge.
+Funkdetails enthalten zuletzt gemeldete Credits samt Messzeit, Paketbedarf
+einschließlich Reserve und Budgetfehler. Der Countdown bezeichnet die nächste
+Budgetprüfung, nicht die garantierte Sendezeit.
+
+Frontendtests: `node --experimental-vm-modules --test custom_components/cul_max/tests/frontend/*.test.mjs`.
+Die Browserchecks `check_room_card.py`, `check_queue_card.py` und
+`check_shared_cards.py` starten jeweils einen temporären lokalen HTTP-Server.

@@ -1,8 +1,9 @@
+const { cardStyles } = await import(new URL("./cul-max-card-styles.js" + new URL(import.meta.url).search, import.meta.url));
 /* Queue UI uses HA service responses and the queue sensor's revision signal. */
 const queueStatuses = {
   debouncing: "Wird gesammelt",
-  queued: "Wartet", waiting_for_credits: "Wartet auf Credits", sending: "Wird gesendet",
-  awaiting_ack: "Wartet auf ACK", retrying: "Wiederholungsversuch", completed: "Abgeschlossen",
+  queued: "Wartet", waiting_for_credits: "Wartet auf Funkbudget", sending: "Wird gesendet",
+  awaiting_ack: "Wartet auf Bestätigung", retrying: "Wiederholungsversuch", completed: "Abgeschlossen",
   failed: "Fehlgeschlagen", cancelled: "Abgebrochen", superseded: "Ersetzt", cancelling: "Wird abgebrochen",
 };
 const escapeQueueText = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -38,7 +39,7 @@ class CulMaxQueueCard extends HTMLElement {
       if (this.isConnected) this._attach();
     } else this._hass = hass;
     const revisions = Object.values(hass.states || {}).filter((state) => state.attributes?.cul_max_queue)
-      .map((state) => `${state.attributes.config_entry_id}:${state.attributes.session_id}:${state.attributes.revision}`).sort().join("|");
+      .map((state) => `${state.attributes.config_entry_id}:${state.attributes.session_id}:${state.attributes.revision}:${state.attributes.budget_revision ?? 0}`).sort().join("|");
     if (revisions !== this._revisionSignal) {
       this._revisionSignal = revisions;
       this._refresh();
@@ -65,7 +66,7 @@ class CulMaxQueueCard extends HTMLElement {
     this._countdownTimer = undefined;
   }
   _syncCountdown(items) {
-    if (!this.isConnected || !items.some((item) => item.status === "debouncing")) {
+    if (!this.isConnected || !items.some((item) => item.status === "debouncing") && !this._controller()?.budget?.next_attempt_at) {
       this._stopCountdown();
       return;
     }
@@ -73,8 +74,13 @@ class CulMaxQueueCard extends HTMLElement {
       const remaining = Math.max(0, (Date.parse(node.dataset.debounceUntil) - Date.now()) / 1000);
       node.textContent = `${remaining.toFixed(1)} s`;
     });
-    update();
-    if (this._countdownTimer === undefined) this._countdownTimer = window.setInterval(update, 100);
+    const updateBudget = () => this.shadowRoot.querySelectorAll("[data-budget-until]").forEach((node) => {
+      const seconds = Math.ceil((Date.parse(node.dataset.budgetUntil) - Date.now()) / 1000);
+      node.textContent = seconds > 0 ? `Nächste Budgetprüfung in ${seconds} s` : "Budgetprüfung ausstehend";
+    });
+    const tick = () => { update(); updateBudget(); };
+    tick();
+    if (this._countdownTimer === undefined) this._countdownTimer = window.setInterval(tick, 100);
   }
   getCardSize() { return 5; }
 
@@ -118,7 +124,7 @@ class CulMaxQueueCard extends HTMLElement {
     const config = this._config || {};
     const entries = (controller.entries || []).filter((entry) => entry.scope === "general");
     const jobs = (controller.jobs || []).filter((job) => !["completed", "cancelled"].includes(job.status))
-      .map((job) => ({ ...job, command_type: job.kind === "climate" ? "Wochenprofil" : "Konfiguration",
+      .map((job) => ({ ...job, command_type: job.block === "temperature" ? "Temperaturparameter" : job.kind === "climate" ? "Wochenplan" : "Konfiguration",
         cancellable: false, attempts: job.attempts || 0 }));
     return [...entries, ...jobs].filter((entry) =>
       (!config.address || entry.device_address === config.address.toUpperCase()) &&
@@ -139,47 +145,66 @@ class CulMaxQueueCard extends HTMLElement {
     finally { this._busy = false; await this._refresh(); }
   }
 
+  _time(value) {
+    const date = new Date(value);
+    if (!value || !Number.isFinite(date.getTime())) return "Zeit unbekannt";
+    const locale = this._hass?.locale?.language || "de-DE";
+    const zone = {timeZone: this._hass?.config?.time_zone};
+    const day = new Intl.DateTimeFormat(locale, {...zone, day:"2-digit",month:"2-digit",year:"numeric"});
+    const time = new Intl.DateTimeFormat(locale, {...zone, hour:"2-digit",minute:"2-digit",second:"2-digit"}).format(date);
+    return day.format(date) === day.format(new Date()) ? time : day.format(date) + ", " + time;
+  }
   _render() {
     if (!this.shadowRoot || !this._config) return;
+    const opened = new Set([...this.shadowRoot.querySelectorAll("details[open][data-preserve]")].map((node) => node.dataset.preserve));
+    const focused = this.shadowRoot.activeElement;
+    const focusSelector = focused?.id ? "#" + focused.id : focused?.dataset.delete ? `[data-delete="${focused.dataset.delete}"]` : focused?.dataset.cancel ? `[data-cancel="${focused.dataset.cancel}"]` : focused?.dataset.select ? `[data-select="${focused.dataset.select}"]` : focused?.tagName === "SUMMARY" && focused.parentElement.dataset.preserve ? `details[data-preserve="${focused.parentElement.dataset.preserve}"] > summary` : null;
     const h = escapeQueueText;
     const controller = this._controller();
-    const items = this._items();
+    const next = controller?.next_dispatch;
+    const isNext = (item) => !!next && (item.id === next.entry_id || item.id === next.job_id);
+    const rank = (item) => ["sending", "awaiting_ack", "retrying", "cancelling"].includes(item.status) ? 0 : isNext(item) ? 1 : 2;
+    const items = this._items().sort((a, b) => rank(a) - rank(b) || (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0) || a.id.localeCompare(b.id));
     const waiting = items.filter((item) => ["debouncing", "queued", "waiting_for_credits"].includes(item.status)).length;
     const active = items.filter((item) => ["sending", "awaiting_ack", "retrying", "cancelling"].includes(item.status)).length;
     const credits = controller?.budget;
     this.shadowRoot.innerHTML = `
-      <style>
-        :host { display:block; } ha-card { display:block; padding:16px; background:var(--ha-card-background,var(--card-background-color)); color:var(--primary-text-color); }
-        h2 { font-size:20px; font-weight:500; margin:0 0 10px; overflow-wrap:anywhere; }
+      <style>${cardStyles}
+        h2 { margin-bottom:12px; }
         .summary,.muted { color:var(--secondary-text-color); font-size:13px; } .summary { display:flex; gap:12px; flex-wrap:wrap; }
         .row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; padding:14px 0; border-top:1px solid var(--divider-color); }
         .row > button { align-self:start; max-width:150px; }
-        .body { min-width:0; overflow-wrap:anywhere; } .device { font-weight:600; margin-bottom:5px; } .description { margin-bottom:5px; }
-        .rows { margin-top:14px; } button,select { font:inherit; padding:8px 10px; border:1px solid var(--divider-color); border-radius:8px; color:var(--primary-color); background:var(--secondary-background-color); }
+        .body { min-width:0; overflow-wrap:anywhere; } .device { display:flex;align-items:center;gap:8px;font-weight:600; margin-bottom:5px; } .description { margin-bottom:5px; }
+        .rows { margin-top:14px; }
         button { cursor:pointer; } button:disabled { cursor:default; color:var(--disabled-text-color); } button:focus-visible,select:focus-visible { outline:2px solid var(--primary-color); }
-        .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; } .notice { padding:10px 0; overflow-wrap:anywhere; } .error { color:var(--error-color); }
+        .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }  .error { color:var(--error-color); }
         pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; } summary { cursor:pointer; margin-top:6px; } label { display:block; }
-        @media(max-width:380px) { .row { grid-template-columns:minmax(0,1fr); } .row button { justify-self:start; } }
+        @media(max-width:380px) { .row { grid-template-columns:minmax(0,1fr); } .row button { justify-self:start;max-width:none; } }
       </style>
       <ha-card><h2>${h(this._config.title)}</h2>
       ${(this._data?.controllers?.length || 0) > 1 && !this._config.config_entry_id ? `<label>Controller <select id="controller"><option value="">Bitte wählen</option>${this._data.controllers.map((c) => `<option value="${h(c.config_entry_id)}" ${controller === c ? "selected" : ""}>${h(c.name)}</option>`).join("")}</select></label>` : ""}
-      <div class="summary"><span>Wartend: ${waiting}</span><span>Aktiv: ${active}</span>${credits ? `<span>Credits: ${h(credits.reported_credits ?? "unbekannt")} / 900${credits.budget_valid ? "" : " (nicht synchronisiert)"}</span>` : ""}</div>
+      <div class="summary"><span>Wartend: ${waiting}</span><span>Aktiv: ${active}</span></div>
+      <div class="notice" role="status">${h(!credits?.budget_valid ? credits?.last_budget_error ? "Funkbudget nicht verfügbar" : "Funkbudget unbekannt" : credits.waiting_for_budget ? "Wartet auf Funkbudget" : active ? "Übertragung läuft" : items.length ? "Aufträge warten" : "Keine wartenden Aufträge")}${credits?.waiting_for_budget && credits?.next_attempt_at ? ` · <span data-budget-until="${h(credits.next_attempt_at)}"></span>` : ""}</div>
+      ${next && !items.some(isNext) ? '<div class="muted">Der nächste Versand betrifft einen ausgeblendeten Auftrag.</div>' : ""}
+      ${credits ? `<details data-preserve="budget"><summary>Funkdetails</summary><div class="muted">Zuletzt gemeldet: ${h(credits.reported_credits ?? "unbekannt")} Credits · Gemessen: ${h(this._time(credits.last_budget_query_at))}<br>Nächstes Paket einschließlich Reserve: ${h(credits.required_credits ?? "unbekannt")} Credits</div>${credits.last_budget_error ? `<div class="error">${h(credits.last_budget_error)}</div>` : ""}</details>` : ""}
       ${this._error ? `<div class="notice error" role="alert">${h(this._error)}</div><button id="reload">Erneut laden</button>` : ""}
       ${this._message ? `<div class="notice" role="status">${h(this._message)}</div>` : ""}
       <div class="rows">${items.map((item) => {
         const isJob = item.scope === "configuration";
         const description = item.description.replace(/^SetTemperature /, "Solltemperatur → ");
-        const created = item.created_at ? new Date(item.created_at).toLocaleString("de-DE") : "unbekannt";
+        const created = this._time(item.created_at);
         return `<div class="row"><div class="body"><div class="device">${item.cancellable ? `<input type="checkbox" aria-label="${h(item.device_name)} auswählen" data-select="${h(item.id)}" ${this._selected.has(item.id) ? "checked" : ""}> ` : ""}${h(item.device_name || item.device_address)}</div>
-          <div class="description">${h(description)}</div><div>${h(queueStatuses[item.status] || item.status)}${item.status === "debouncing" ? ` · <span data-debounce-until="${h(item.debounce_until)}"></span>` : ""}</div>
-          <div class="muted">${h(item.command_type)} · Erstellt: ${h(created)} · Versuche: ${h(item.attempts)}</div>
+          <div class="description">${h(isJob ? item.command_type : description)}</div>${isNext(item) ? '<span class="badge">Als Nächstes vorgesehen</span>' : ""}<div class="muted">Eingereiht: ${h(created)}</div><div>${h(queueStatuses[item.status] || item.status)}${item.status === "debouncing" ? ` · <span data-debounce-until="${h(item.debounce_until)}"></span>` : ""}</div>
+
           ${isJob ? `<div class="muted">${item.completed_steps?.length || 0} / ${item.steps?.length || 0} Schritte übertragen · ${item.confirmed_steps?.length || 0} bestätigt</div>` : ""}
           ${item.last_error ? `<div class="error">${h(item.last_error)}</div>` : ""}
-          <details><summary>Details</summary><pre>${h(JSON.stringify(item, null, 2))}</pre></details></div>
+          <details data-preserve="${h(item.id)}"><summary>Details</summary><div class="muted">Versuche: ${h(item.attempts)}</div><pre>${h(JSON.stringify(item, null, 2))}</pre></details></div>
           <button data-${isJob ? "cancel" : "delete"}="${h(item.id)}" ${this._busy || (!isJob && !item.cancellable) || item.status === "cancelling" ? "disabled" : ""} title="${h(item.blocked_reason || "")}">${isJob ? "Auftrag abbrechen" : item.cancellable ? "Löschen" : "Nicht löschbar"}</button></div>`;
-      }).join("") || `<div class="notice">${controller ? "Keine wartenden Aufträge" : this._data ? "Controller auswählen" : "Warteschlange wird geladen …"}</div>`}</div>
+      }).join("") || `<div class="${controller ? "empty-queue" : "notice"}">${controller ? "" : this._data ? "Controller auswählen" : "Warteschlange wird geladen …"}</div>`}</div>
       <div class="actions"><button id="clear" ${!controller || this._busy || !items.some((item) => item.cancellable) ? "disabled" : ""}>Wartende Befehle leeren</button>
       <button id="delete-selected" ${!this._selected.size || this._busy ? "disabled" : ""}>Auswahl löschen (${this._selected.size})</button></div></ha-card>`;
+    for (const detail of this.shadowRoot.querySelectorAll("details[data-preserve]")) detail.open = opened.has(detail.dataset.preserve);
+    if (focusSelector) this.shadowRoot.querySelector(focusSelector)?.focus();
     this._syncCountdown(items);
     this.shadowRoot.querySelector("#reload")?.addEventListener("click", () => this._refresh());
     this.shadowRoot.querySelector("#controller")?.addEventListener("change", (event) => { this._controllerId = event.target.value; this._selected.clear(); this._render(); });

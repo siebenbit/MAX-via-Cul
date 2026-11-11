@@ -39,6 +39,42 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     def ack(self):
         self.cul.frame_hook = lambda cul, cmd: cul.feed(transport.ack_line(cmd))
 
+    async def test_next_dispatch_is_read_only_and_maps_configuration_job(self):
+        future = self.clock.create_future()
+        entry = mod.QueueEntry("123456", "Room", "ConfigWeekProfile", "Profile", future,
+                               job_id="job", scope="configuration")
+        self.c._command_queue.add(entry)
+        before = self.c._command_queue.qsize()
+        for _ in range(2):
+            self.assertEqual(self.c.get_queue()["next_dispatch"],
+                             {"entry_id": entry.id, "job_id": "job"})
+        self.assertEqual(self.c._command_queue.qsize(), before)
+        self.c._command_queue.finish(entry, "cancelled")
+        self.assertIsNone(self.c.get_queue()["next_dispatch"])
+
+    async def test_next_dispatch_skips_blocked_entries_and_honors_radio_priority(self):
+        blocked = mod.QueueEntry("123456", "Room", "Test", "Blocked", self.clock.create_future(),
+                                 ready_task=self.clock.create_future(), ready_deadline=self.clock.time() + 60)
+        ready = mod.QueueEntry("123456", "Room", "Test", "Ready", self.clock.create_future())
+        self.c._command_queue.add(blocked)
+        self.c._command_queue.add(ready)
+        self.assertEqual(self.c.get_queue()["next_dispatch"]["entry_id"], ready.id)
+        cmd = protocol.build_time_information(1, self.c.own_address, 0x123456)
+        priority = mod.QueueEntry("123456", "Room", "Test", "Priority", self.clock.create_future())
+        self.c._radio_requests = [
+            types.SimpleNamespace(entry=ready, cmd=cmd, priority=False, sequence=1,
+                                  future=self.clock.create_future(), written=False),
+            types.SimpleNamespace(entry=priority, cmd=cmd, priority=True, sequence=2,
+                                  future=self.clock.create_future(), written=False)]
+        self.assertEqual(self.c.get_queue()["next_dispatch"]["entry_id"], priority.id)
+        self.c._radio_requests[1].written = True
+        self.assertIsNone(self.c.get_queue()["next_dispatch"])
+        for request in self.c._radio_requests:
+            request.future.cancel()
+        self.c._radio_requests.clear()
+        self.c._command_queue.finish(blocked, "cancelled")
+        self.c._command_queue.finish(ready, "cancelled")
+
     async def test_only_latest_temperature_is_transmitted(self):
         self.cul.credits = 0
         self.worker()

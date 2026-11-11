@@ -1,14 +1,15 @@
 """Browser checks with simulated HA and no RF hardware or runtime dependencies."""
 from pathlib import Path
+from preview_server import preview_server
 from playwright.sync_api import sync_playwright, expect
 
 fixture = Path(__file__).with_name("room-card-harness.html").resolve().as_uri()
-with sync_playwright() as p:
+with preview_server() as origin, sync_playwright() as p:
     browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
     page = browser.new_page(viewport={"width": 1200, "height": 1300}, locale="de-DE")
     errors = []
     page.on("pageerror", lambda err: errors.append(str(err)))
-    page.goto(fixture)
+    page.goto(origin + "/tests/frontend/room-card-harness.html")
     card = page.locator("cul-max-room-config-card")
     expect(card.get_by_role("heading", name="MAX! Raumkonfiguration")).to_be_visible()
     expect(card.get_by_text("Gespeicherte Konfiguration für", exact=False)).to_have_count(0)

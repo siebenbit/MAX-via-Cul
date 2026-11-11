@@ -1,9 +1,10 @@
+import { loadCard } from "./module-loader.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-function setup() {
+async function setup() {
   const elements = new Map();
   const timers = new Map();
   class Element {
@@ -13,8 +14,8 @@ function setup() {
   }
   const context = vm.createContext({ HTMLElement: Element, window: { confirm: () => true, setInterval: (callback) => { const id = timers.size + 1; timers.set(id, callback); return id; }, clearInterval: (id) => timers.delete(id) },
     customElements: { get: (key) => elements.get(key), define: (key, value) => elements.set(key, value) },
-    document: { createElement: (name) => new (elements.get(name))() }, CustomEvent: class {}, console });
-  vm.runInContext(readFileSync(new URL("../../frontend/cul-max-queue-card.js", import.meta.url), "utf8"), context);
+    document: { createElement: (name) => new (elements.get(name))() }, CustomEvent: class {}, URL, console });
+  await loadCard(new URL("../../frontend/cul-max-queue-card.js", import.meta.url), context);
   const Card = elements.get("cul-max-queue-card");
   const card = new Card();
   const listeners = new Map();
@@ -30,10 +31,10 @@ function setup() {
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 
 test("empty queue, credits and escaped descriptions render safely", async () => {
-  const { card, controller } = setup();
+  const { card, controller } = await setup();
   await tick();
   assert.match(card.shadowRoot.innerHTML, /Keine wartenden Aufträge/);
-  assert.match(card.shadowRoot.innerHTML, /185 \/ 900/);
+  assert.match(card.shadowRoot.innerHTML, /185 Credits/);
   controller.entries.push({ id: "1", scope: "general", status: "queued", cancellable: true,
     device_name: "<script>bad</script>", description: "SetTemperature 23°C", command_type: "SetTemperature", attempts: 0 });
   card._render();
@@ -42,7 +43,7 @@ test("empty queue, credits and escaped descriptions render safely", async () => 
 });
 
 test("filters preserve protected entries and separate configuration jobs", async () => {
-  const { card, controller } = setup();
+  const { card, controller } = await setup();
   await tick();
   controller.entries.push({ id: "1", scope: "general", device_address: "ABCDEF", status: "awaiting_ack", cancellable: false, description: "Temperature" });
   controller.jobs.push({ id: "job", scope: "configuration", kind: "climate", device_address: "123456", status: "queued", description: "Monday" });
@@ -55,7 +56,7 @@ test("filters preserve protected entries and separate configuration jobs", async
 });
 
 test("actions use response API and explain racing failures", async () => {
-  const { card, hass, calls } = setup();
+  const { card, hass, calls } = await setup();
   await tick();
   await card._action("delete_queue_entry", { entry_id: "1" }, "Gelöscht");
   const command = calls.find((call) => call.service === "delete_queue_entry");
@@ -70,7 +71,7 @@ test("actions use response API and explain racing failures", async () => {
 });
 
 test("reconnect refreshes, detach removes listeners, stale snapshots are discarded", async () => {
-  const { card, hass, listeners } = setup();
+  const { card, hass, listeners } = await setup();
   await tick();
   assert.equal(listeners.size, 2);
   let resolve;
@@ -84,7 +85,7 @@ test("reconnect refreshes, detach removes listeners, stale snapshots are discard
 });
 
 test("unchanged sensor revisions cause no polling", async () => {
-  const { card, hass, calls } = setup();
+  const { card, hass, calls } = await setup();
   await tick();
   const initial = calls.length;
   for (let i = 0; i < 100; i++) card.hass = hass;
@@ -92,8 +93,8 @@ test("unchanged sensor revisions cause no polling", async () => {
   assert.equal(calls.length, initial);
 });
 
-test("editor exposes title, controller, device, status and scope", () => {
-  const { elements } = setup();
+test("editor exposes title, controller, device, status and scope", async () => {
+  const { elements } = await setup();
   const Editor = elements.get("cul-max-queue-card-editor");
   const editor = new Editor();
   editor.setConfig({ title: "My queue" });
@@ -103,7 +104,7 @@ test("editor exposes title, controller, device, status and scope", () => {
 
 
 test("debouncing is visible, cancellable and counts down locally without polling", async () => {
-  const { card, controller, timers, calls } = setup();
+  const { card, controller, timers, calls } = await setup();
   await tick();
   controller.entries.push({ id: "debounce", scope: "general", device_address: "ABCDEF",
     device_name: "Bad", description: "SetTemperature 23 °C", command_type: "SetTemperature",
@@ -120,4 +121,24 @@ test("debouncing is visible, cancellable and counts down locally without polling
   assert.equal(calls.length, previous);
   card.disconnectedCallback();
   assert.equal(timers.size, 0);
+});
+
+test("next dispatch sorts before older waiting work and temperature jobs have the right label", async () => {
+  const { card, controller } = await setup(); await tick();
+  controller.entries = [
+    {id:"old",scope:"general",status:"queued",description:"Old",created_at:"2026-11-10T10:00:00Z"},
+    {id:"next",scope:"general",status:"queued",description:"Next",created_at:"2026-11-10T11:00:00Z"},
+  ];
+  controller.next_dispatch = {entry_id:"next",job_id:null};
+  controller.jobs = [{id:"job",scope:"configuration",kind:"climate",block:"temperature",status:"queued",description:"Profile"}];
+  card._render();
+  const html = card.shadowRoot.innerHTML;
+  assert.ok(html.indexOf(">Next<") < html.indexOf(">Old<"));
+  assert.match(html, /Als Nächstes vorgesehen/);
+  assert.match(html, /Temperaturparameter/);
+  assert.doesNotMatch(html, /185 \/ 900/);
+  controller.budget.budget_valid = false;
+  controller.budget.last_budget_error = "Disconnected";
+  card._render();
+  assert.match(card.shadowRoot.innerHTML, /Funkbudget nicht verfügbar/);
 });

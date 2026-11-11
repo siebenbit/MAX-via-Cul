@@ -1,3 +1,4 @@
+const { cardStyles } = await import(new URL("./cul-max-card-styles.js" + new URL(import.meta.url).search, import.meta.url));
 /* Room configuration uses only the documented cul_max actions and subscription. */
 const ROOM_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 const ROOM_DAY_LABELS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
@@ -251,6 +252,7 @@ class CulMaxRoomConfigCard extends HTMLElement {
   }
   _selectRoom(area) {
     if (area !== this._area && this._dirty() && !window.confirm("Ungespeicherte Änderungen verwerfen und den Raum wechseln?")) { this._render(); return; }
+    this._progressOpen = undefined;
     this._area = area; this._changes = {}; this._baseRevision = {}; this._conflict = false; this._error = ""; this._message = ""; this._pendingOperation = null;
     this._copyOpen = false; this._copyTargets.clear();
     this._receive({ rooms: this._rooms });
@@ -341,14 +343,16 @@ class CulMaxRoomConfigCard extends HTMLElement {
   _render() {
     if (!this.shadowRoot || !this._config) return;
     this._rendered = true;
+    const helpOpen = this._helpOpen; const helpPinned = this._helpPinned;
     const focused = this.shadowRoot.activeElement;
-    const focusKey = focused?.dataset.focus;
+    const focusKey = focused?.dataset.focus || (focused?.hasAttribute?.("data-help-button") ? "help-" + focused.closest("[data-help]").dataset.help : null);
     const selection = focused?.selectionStart;
     const room = this._room();
     const rows = this._rows();
     const disabledTemp = this._locked("temperature") ? "disabled" : "";
     const disabledWeek = this._locked("week_profile") ? "disabled" : "";
-    this.shadowRoot.innerHTML = `<style>${CulMaxRoomConfigCard.styles}</style><ha-card><div class="header"><h2>${roomEscape(this._config.title)}</h2><span class="badge" data-badge>${this._dirty() ? "Entwurf" : "Bereit"}</span></div>
+    this.shadowRoot.innerHTML = `<style>${cardStyles}
+${CulMaxRoomConfigCard.styles}</style><ha-card><div class="header"><h2>${roomEscape(this._config.title)}</h2><span class="badge" data-badge>${this._dirty() ? "Entwurf" : "Bereit"}</span></div>
       <label class="room">Raum<select data-room ${this._saving ? "disabled" : ""}>${this._area && !room ? `<option value="${roomEscape(this._area)}" selected disabled>Raum nicht mehr verfügbar</option>` : ""}${this._rooms.map((r) => `<option value="${roomEscape(r.id)}" ${r.id === this._area ? "selected" : ""}>${roomEscape(r.name)}</option>`).join("")}</select></label>
       ${!this._online ? '<div class="notice">Live-Verbindung nicht verfügbar. <button data-reconnect class="compact">Erneut verbinden</button></div>' : ""}
       ${this._error ? `<div class="error" role="alert">${roomEscape(this._error)}</div>` : ""}
@@ -364,7 +368,7 @@ class CulMaxRoomConfigCard extends HTMLElement {
       ${this._copyPanel(disabledWeek)}</section>
       <div class="error" data-errors role="alert">${roomEscape(this._errors().join(" "))}</div>
       <div class="actions"><button data-discard ${!this._dirty() || this._saving ? "disabled" : ""}>Verwerfen</button><button class="primary" data-save ${this._canSave() ? "" : "disabled"}>${this._saving ? "Wird eingereiht …" : "Speichern"}</button></div>
-      <details ${room.devices.some((d) => d.jobs.length) ? "open" : ""}><summary>Geräte und Übertragungsfortschritt</summary>${this._progress(room)}</details>`
+      <details ${(this._progressOpen ?? room.devices.some((d) => d.jobs.length)) ? "open" : ""}><summary data-focus="progress">Geräte und Übertragungsfortschritt</summary>${this._progress(room)}</details>`
         : '<div class="empty">Keine MAX!-Thermostate in einem HA-Bereich gefunden. Ordne die Geräte in Home Assistant einem Bereich zu.</div>'}</ha-card>`;
     const query = (s) => this.shadowRoot.querySelector(s);
     this._helpOpen = null; this._helpPinned = false;
@@ -379,6 +383,7 @@ class CulMaxRoomConfigCard extends HTMLElement {
       button.addEventListener("click", () => this._showFieldHelp(this._helpPinned && this._helpOpen === key ? null : key, !this._helpPinned));
       button.addEventListener("keydown", (event) => { if (event.key === "Escape") { this._showFieldHelp(null); event.preventDefault(); } });
     });
+    query('[data-focus="progress"]')?.addEventListener("click", () => { this._progressOpen = !query("details").open; });
     query("[data-room]")?.addEventListener("change", (event) => this._selectRoom(event.target.value));
     query("[data-save]")?.addEventListener("click", () => this._save());
     query("[data-discard]")?.addEventListener("click", () => this._discard());
@@ -403,13 +408,68 @@ class CulMaxRoomConfigCard extends HTMLElement {
     query("[data-new]")?.addEventListener("click", () => { this._editRows([{ time: "00:00", temperature: "" }]); this._render(); });
     this.shadowRoot.querySelectorAll("[data-cancel]").forEach((button) => button.addEventListener("click", () => { const device = room.devices.find((d) => d.config_entry_id === button.dataset.owner && d.jobs.some((j) => j.id === button.dataset.cancel)); const job = device?.jobs.find((j) => j.id === button.dataset.cancel); if (job) this._cancel(job, device.config_entry_id); }));
     if (focusKey) {
-      const input = this.shadowRoot.querySelector(`[data-focus="${focusKey}"]`);
+      const input = focusKey.startsWith("help-") ? this.shadowRoot.querySelector(`[data-help="${focusKey.slice(5)}"] [data-help-button]`) : this.shadowRoot.querySelector(`[data-focus="${focusKey}"]`);
       input?.focus?.({ preventScroll: true });
       if (selection != null) { try { input.setSelectionRange(selection, selection); } catch (_) { /* number/time input */ } }
     }
+    if (helpOpen) this._showFieldHelp(helpOpen, helpPinned);
   }
   static trash = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2m-3 6h12l-1 12H7L6 9m4 2v8h1v-8h-1m3 0v8h1v-8h-1Z"/></svg>';
-  static styles = `:host{display:block;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,inherit)}*{box-sizing:border-box}ha-card{display:block;background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ddd);border-radius:var(--ha-card-border-radius,20px);padding:20px}.header{display:flex;align-items:center;justify-content:space-between;gap:12px}h2{font-size:1.35rem;margin:0;min-width:0;overflow-wrap:anywhere}h3{font-size:1.05rem;margin:0 0 16px}h4{font-size:1rem;margin:0}.row-heading span,small{color:var(--secondary-text-color,#666);font-size:.88rem;line-height:1.5}.badge{background:var(--secondary-background-color,#eee);padding:6px 10px;border-radius:20px;font-size:.8rem}.room{display:grid;gap:6px;margin:20px 0 10px;font-weight:600}section{border-top:1px solid var(--divider-color,#ddd);margin-top:22px;padding-top:20px}.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.fields label{font-size:.9rem}.field{position:relative;min-width:0}.field-label{display:flex;align-items:center;gap:6px;min-height:32px}.help-button{display:inline-flex;align-items:center;justify-content:center;flex:none;min-height:32px;width:32px;padding:0;border:0;border-radius:50%;font-size:19px;color:var(--secondary-text-color,#666)}.field-tooltip{position:absolute;top:36px;left:0;right:0;z-index:5;padding:12px;border:1px solid var(--divider-color,#ccc);border-radius:10px;background:var(--ha-card-background,var(--card-background-color,#fff));box-shadow:0 4px 16px #0003;font-size:.88rem;line-height:1.5;overflow-wrap:anywhere}.input-unit{display:flex;align-items:center;gap:8px;margin-top:7px}.input-unit input{width:100%}input,select,button{font:inherit;color:var(--primary-text-color);background:var(--ha-card-background,var(--card-background-color,#fff));border:1px solid var(--divider-color,#ccc);border-radius:22px;min-height:44px;padding:9px 14px;max-width:100%;min-width:0}select{width:100%}input:focus,select:focus,button:focus-visible{outline:2px solid var(--primary-color,#519eb5);outline-offset:2px}button{cursor:pointer;transition:background .15s}button:hover:not(:disabled){background:var(--secondary-background-color,#eee)}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:default}button.primary,button.selected{background:var(--primary-text-color,#111);color:var(--card-background-color,#fff);border-color:transparent}button.primary:hover:not(:disabled){opacity:.85;background:var(--primary-text-color,#111)}.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}.days button{padding:7px 2px;min-height:38px;display:flex;align-items:center;justify-content:center;gap:5px}.dirty-dot{display:inline-block;flex:none;width:9px;height:9px;border-radius:50%;background:var(--primary-color,#519eb5);box-shadow:0 0 0 1px currentColor}.copy-panel{min-width:0;margin:16px 0 0;padding:14px;border:1px solid var(--divider-color,#ccc);border-radius:12px}.copy-panel legend{font-weight:600;padding:0 5px}.copy-days{display:flex;flex-wrap:wrap;gap:8px}.copy-days label{display:flex;align-items:center;gap:5px;min-height:44px;padding:0 6px;cursor:pointer}.copy-days input{width:20px;height:20px;min-height:0;padding:0;accent-color:var(--primary-color,#519eb5)}.copy-tools,.copy-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.copy-panel p{font-size:.88rem;line-height:1.5;color:var(--secondary-text-color,#666)}.switch-row{display:grid;grid-template-columns:minmax(0,1fr) 18px minmax(0,1fr) 23px 32px;align-items:center;gap:10px;margin:9px 0}.switch-row input{width:100%}.icon{border:0;border-radius:50%;padding:6px;min-height:36px;display:flex;justify-content:center}.wide{display:block;width:100%;margin-top:12px}.row-heading{display:flex;justify-content:space-between;gap:8px;margin:18px 0 12px}.status{display:block;color:var(--secondary-text-color);font-size:.8rem;font-weight:400;margin-top:6px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-top:1px solid var(--divider-color);padding-top:20px;margin-top:22px}.error{color:var(--error-color,#b33);margin-top:12px;font-size:.9rem;overflow-wrap:anywhere}.error:empty{display:none}.notice{background:var(--secondary-background-color,#eee);border-radius:12px;padding:12px;margin:12px 0;font-size:.9rem}.compact{min-height:34px;padding:5px 10px;font-size:.8rem}.empty{padding:32px 8px;color:var(--secondary-text-color);text-align:center;line-height:1.5}[data-graph]{min-height:180px;margin-top:12px}svg{display:block;width:100%;max-height:310px}svg text{fill:var(--secondary-text-color,#777);font-size:14px}.grid line{stroke:var(--divider-color,#ddd);stroke-dasharray:6 5}.curve{stroke:var(--primary-color,#519eb5);stroke-width:4;fill:none;stroke-linejoin:round}.fill{fill:var(--primary-color,#519eb5);opacity:.12}details{margin-top:22px;font-size:.9rem}summary{cursor:pointer;min-height:30px}.device{padding:12px 0;border-top:1px solid var(--divider-color);margin-top:8px}.device strong{overflow-wrap:anywhere}.device small{display:block}.job{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:8px;overflow-wrap:anywhere}@media(max-width:480px){ha-card{padding:14px}.fields{grid-template-columns:1fr}.switch-row{gap:5px;grid-template-columns:minmax(0,1.6fr) 12px minmax(0,.7fr) 20px 28px}.switch-row input{padding:9px 8px}.row-heading span{font-size:.75rem}h2{font-size:1.12rem}.header{align-items:flex-start}.badge{font-size:.7rem}.days button{font-size:.85rem}.job{align-items:flex-start}}`;
+  static styles = `h4{font-size:1rem;margin:0}
+.row-heading span,small{color:var(--secondary-text-color,#666);font-size:.88rem;line-height:1.5}
+.room{display:grid;gap:6px;margin:12px 0 8px;font-weight:600}
+.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.fields label{font-size:.9rem}
+.field{position:relative;min-width:0}
+.field-label{display:flex;align-items:center;gap:6px;min-height:32px}
+.help-button{display:inline-flex;align-items:center;justify-content:center;flex:none;min-height:32px;width:32px;padding:0;border:0;border-radius:50%;font-size:19px;color:var(--secondary-text-color,#666)}
+.field-tooltip{position:absolute;top:36px;left:0;right:0;z-index:5;padding:12px;border:1px solid var(--divider-color,#ccc);border-radius:10px;background:var(--ha-card-background,var(--card-background-color,#fff));box-shadow:0 4px 16px #0003;font-size:.88rem;line-height:1.5;overflow-wrap:anywhere}
+.input-unit{display:flex;align-items:center;gap:8px;margin-top:7px}
+.input-unit input{width:100%}
+select{width:100%}
+input:focus,select:focus,button:focus-visible{outline:2px solid var(--primary-color,#519eb5);outline-offset:2px}
+button.primary:hover:not(:disabled){opacity:.85;background:var(--primary-text-color,#111)}
+.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}
+.days button{padding:7px 2px;display:flex;align-items:center;justify-content:center;gap:5px}
+.dirty-dot{display:inline-block;flex:none;width:9px;height:9px;border-radius:50%;background:var(--primary-color,#519eb5);box-shadow:0 0 0 1px currentColor}
+.copy-panel{min-width:0;margin:16px 0 0;padding:14px;border:1px solid var(--divider-color,#ccc);border-radius:12px}
+.copy-panel legend{font-weight:600;padding:0 5px}
+.copy-days{display:flex;flex-wrap:wrap;gap:8px}
+.copy-days label{display:flex;align-items:center;gap:5px;min-height:44px;padding:0 6px;cursor:pointer}
+.copy-days input{width:20px;height:20px;min-height:0;padding:0;accent-color:var(--primary-color,#519eb5)}
+.copy-tools,.copy-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.copy-panel p{font-size:.88rem;line-height:1.5;color:var(--secondary-text-color,#666)}
+.switch-row{display:grid;grid-template-columns:minmax(0,1fr) 18px minmax(0,1fr) 23px 32px;align-items:center;gap:10px;margin:9px 0}
+.switch-row input{width:100%}
+.icon{border:0;border-radius:50%;padding:6px;min-height:36px;display:flex;justify-content:center}
+.wide{display:block;width:100%;margin-top:12px}
+.row-heading{display:flex;justify-content:space-between;gap:8px;margin:18px 0 12px}
+.status{display:block;color:var(--secondary-text-color);font-size:.8rem;font-weight:400;margin-top:6px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-top:1px solid var(--divider-color);padding-top:16px;margin-top:16px}
+.error{color:var(--error-color,#b33);margin-top:12px;font-size:.9rem;overflow-wrap:anywhere}
+.error:empty{display:none}
+.compact{min-height:44px;padding:5px 10px;font-size:.8rem}
+.empty{padding:32px 8px;color:var(--secondary-text-color);text-align:center;line-height:1.5}
+[data-graph]{min-height:180px;margin-top:12px}
+svg{display:block;width:100%;max-height:310px}
+svg text{fill:var(--secondary-text-color,#777);font-size:14px}
+.grid line{stroke:var(--divider-color,#ddd);stroke-dasharray:6 5}
+.curve{stroke:var(--primary-color,#519eb5);stroke-width:4;fill:none;stroke-linejoin:round}
+.fill{fill:var(--primary-color,#519eb5);opacity:.12}
+details{margin-top:16px;font-size:.9rem}
+summary{cursor:pointer;min-height:30px}
+.device{padding:12px 0;border-top:1px solid var(--divider-color);margin-top:8px}
+.device strong{overflow-wrap:anywhere}
+.device small{display:block}
+.job{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:8px;overflow-wrap:anywhere}
+@media(max-width:480px){.fields{grid-template-columns:1fr}
+.switch-row{gap:5px;grid-template-columns:minmax(0,1.6fr) 12px minmax(0,.7fr) 20px 28px}
+.switch-row input{padding:9px 8px}
+.row-heading span{font-size:.75rem}
+.days button{font-size:.85rem}
+.job{align-items:flex-start}
+}
+`;
 }
 
 class CulMaxRoomConfigCardEditor extends HTMLElement {
