@@ -40,6 +40,21 @@ class PairingHubTests(unittest.TestCase):
         row = self.hub.snapshot()["controllers"][0]["devices"][0]
         self.assertEqual((row["name"],row["area_name"],row["device_id"]),("Heizung","Bad","device"))
 
+    def test_german_type_labels_and_unknown_fallback(self):
+        from datetime import datetime, UTC
+        self.c.pairing_session.start(datetime.now(UTC))
+        self.c.pairing_session.record(self.c.pairing_session.id, "123456", False)
+        device = self.c.get_device("123456")
+        for kind, expected in {1: "Heizkörperthermostat", 2: "Heizkörperthermostat Plus",
+                               3: "Wandthermostat", 4: "Fensterkontakt", 5: "Taster",
+                               0: "MAX! Gerät", 255: "MAX! Gerät"}.items():
+            with self.subTest(kind=kind):
+                device.device_type = kind
+                row = self.hub.snapshot()["controllers"][0]["devices"][0]
+                self.assertEqual(row["device_type"], expected)
+        self.c.get_device = lambda address: None
+        self.assertEqual(self.hub.snapshot()["controllers"][0]["devices"][0]["device_type"], "MAX! Gerät")
+
     def test_reload_retains_results_and_controllers_stay_separate(self):
         from datetime import datetime, UTC
         self.c.pairing_session.start(datetime.now(UTC))

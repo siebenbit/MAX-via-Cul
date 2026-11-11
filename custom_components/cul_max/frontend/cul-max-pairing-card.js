@@ -62,12 +62,14 @@ class CulMaxPairingCard extends HTMLElement {
   }
   async _editDevice(deviceId) {
     if (this._editing || !this._online) return;
+    const device = this._controller()?.devices.find(item => item.device_id === deviceId);
+    if (!device) return;
     this._editing = true;
     this._error = "";
     this._render();
     const epoch = this._epoch;
     try {
-      await openDeviceDialog(this, this._hass, deviceId,
+      await openDeviceDialog(this, this._hass, deviceId, device.device_type,
         () => epoch === this._epoch && this.isConnected && this._online, () => this._hass);
     } catch (error) {
       if (epoch === this._epoch) this._error = error.message || String(error);

@@ -1,6 +1,10 @@
 const { cardStyles, dialogStyles } = await import(new URL("./cul-max-card-styles.js" + new URL(import.meta.url).search, import.meta.url));
 const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+export function defaultDeviceName(deviceType, areaName) {
+  return areaName ? `${deviceType} (${areaName})` : deviceType;
+}
+
 // Only changed registry fields are written, preserving HA's default-name semantics.
 export function deviceChanges(device, name, areaId) {
   const updates = {};
@@ -16,20 +20,25 @@ class CulMaxDeviceDialog extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>${cardStyles}${dialogStyles}</style>
       <dialog aria-labelledby="device-title" aria-describedby="device-subtitle">
         <form><header><h2 id="device-title">Gerät bearbeiten</h2><p id="device-subtitle" class="muted">Name und Raum</p></header>
-          <div class="dialog-body"><label for="device-name">Name</label><input id="device-name" name="name" type="text" autocomplete="off" autofocus>
-            <label for="device-area">Raum</label><select id="device-area" name="area"><option value="">Keinem Raum zugeordnet</option></select>
+          <div class="dialog-body"><label for="device-area">Raum</label><select id="device-area" name="area" autofocus><option value="">Keinem Raum zugeordnet</option></select>
+            <label for="device-name">Name</label><input id="device-name" name="name" type="text" autocomplete="off">
             <p class="error" role="alert" hidden></p></div>
           <footer><button type="button" id="cancel">Abbrechen</button><button type="submit" class="primary" id="save">Speichern</button></footer>
         </form></dialog>`;
     const root = this.shadowRoot;
     this._dialog = root.querySelector("dialog");
-    root.querySelector("#device-name").value = this.device.name_by_user || this.device.name || "";
     const select = root.querySelector("#device-area");
     select.insertAdjacentHTML("beforeend", this.areas.map(area => `<option value="${escape(area.area_id)}">${escape(area.name)}</option>`).join(""));
     if (this.device.area_id && !this.areas.some(area => area.area_id === this.device.area_id)) {
       select.insertAdjacentHTML("beforeend", `<option value="${escape(this.device.area_id)}">Bisheriger Raum nicht mehr verfügbar</option>`);
     }
     select.value = this.device.area_id || "";
+    const suggestName = () => {
+      const area = this.areas.find(item => item.area_id === select.value);
+      root.querySelector("#device-name").value = defaultDeviceName(this.deviceType, area?.name);
+    };
+    suggestName();
+    select.addEventListener("change", suggestName);
     root.querySelector("form").addEventListener("submit", event => { event.preventDefault(); this._save(); });
     root.querySelector("#cancel").addEventListener("click", () => this._dialog.close());
     this._dialog.addEventListener("cancel", event => { if (this._saving) event.preventDefault(); });
@@ -79,7 +88,7 @@ class CulMaxDeviceDialog extends HTMLElement {
 }
 if (!customElements.get("cul-max-device-dialog")) customElements.define("cul-max-device-dialog", CulMaxDeviceDialog);
 
-export async function openDeviceDialog(host, hass, deviceId, isCurrent = () => true, getHass = () => hass) {
+export async function openDeviceDialog(host, hass, deviceId, deviceType, isCurrent = () => true, getHass = () => hass) {
   if (!hass.user?.is_admin) throw Error("Nur für Administratoren verfügbar.");
   const [devices, areas] = await Promise.all([
     hass.callWS({ type: "config/device_registry/list" }),
@@ -91,6 +100,7 @@ export async function openDeviceDialog(host, hass, deviceId, isCurrent = () => t
   if (typeof HTMLDialogElement === "undefined" || !HTMLDialogElement.prototype.showModal) throw Error("Bitte den Browser beziehungsweise Android System WebView aktualisieren.");
   const element = document.createElement("cul-max-device-dialog");
   element.device = device;
+  element.deviceType = deviceType;
   element.areas = [...areas].sort((a, b) => a.name.localeCompare(b.name));
   element.getHass = getHass;
   return new Promise((resolve, reject) => {

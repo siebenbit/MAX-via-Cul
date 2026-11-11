@@ -1,7 +1,7 @@
 """Admin-only live pairing results and controller-specific pairing start."""
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr, area_registry as ar
-from .const import DOMAIN
+from .const import DOMAIN, DEVICE_TYPE_NAMES_DE, DEFAULT_DEVICE_TYPE_NAME_DE
 from .queue_api import CONTROLLERS, select_controller
 
 DATA_KEY = f"{DOMAIN}_pairing_hub"
@@ -40,7 +40,7 @@ class PairingHub:
                 area = areas.async_get_area(entry.area_id) if entry and entry.area_id else None
                 devices.append({**result, "device_id": entry.id if entry else None, "removed": device is None and entry is None,
                     "name": (entry.name_by_user or entry.name) if entry else device.name if device else result["address"],
-                    "device_type": {1: "Heizkörperthermostat", 2: "Heizkörperthermostat Plus", 3: "Wandthermostat", 4: "Fensterkontakt", 5: "Taster"}.get(device.device_type, "MAX! Gerät") if device else "MAX! Gerät",
+                    "device_type": DEVICE_TYPE_NAMES_DE.get(device.device_type, DEFAULT_DEVICE_TYPE_NAME_DE) if device else DEFAULT_DEVICE_TYPE_NAME_DE,
                     "serial_number": device.serial_number if device else None,
                     "area_name": area.name if area else None})
             controllers.append({"config_entry_id": key, "name": f"MAX! CUL ({c.host}:{c.port})",

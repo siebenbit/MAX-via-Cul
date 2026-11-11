@@ -20,6 +20,15 @@ test("canceled loads, missing devices and permissions never open a dialog", asyn
   const hass = {user:{is_admin:false},callWS:async()=>[]};
   await assert.rejects(openDeviceDialog({},hass,"dev"),/Administrator/);
   hass.user.is_admin=true;
-  await openDeviceDialog({},hass,"dev",()=>false);
+  await openDeviceDialog({},hass,"dev","Fensterkontakt",()=>false);
   await assert.rejects(openDeviceDialog({},hass,"dev"),/nicht mehr vorhanden/);
+});
+
+test("German device labels form suggestions without changing spelling", async () => {
+  const { defaultDeviceName } = await setup();
+  for (const type of ["Heizkörperthermostat", "Heizkörperthermostat Plus", "Wandthermostat", "Fensterkontakt", "Taster", "MAX! Gerät"]) {
+    assert.equal(defaultDeviceName(type, "Bad & Küche"), `${type} (Bad & Küche)`);
+    assert.equal(defaultDeviceName(type, undefined), type);
+    assert.equal(defaultDeviceName(type, ""), type);
+  }
 });

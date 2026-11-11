@@ -124,6 +124,16 @@ DEFAULT_OWN_ADDRESS = 0x123456
 # Pairing duration in seconds
 PAIRING_DURATION = 60
 
+# Shared German labels for pairing results and device-name suggestions.
+DEVICE_TYPE_NAMES_DE = {
+    DEVICE_HEATING_THERMOSTAT: "Heizkörperthermostat",
+    DEVICE_HEATING_THERMOSTAT_PLUS: "Heizkörperthermostat Plus",
+    DEVICE_WALL_THERMOSTAT: "Wandthermostat",
+    DEVICE_SHUTTER_CONTACT: "Fensterkontakt",
+    DEVICE_PUSH_BUTTON: "Taster",
+}
+DEFAULT_DEVICE_TYPE_NAME_DE = "MAX! Gerät"
+
 # Device types that are climate entities
 CLIMATE_DEVICE_TYPES = {
     DEVICE_HEATING_THERMOSTAT,
