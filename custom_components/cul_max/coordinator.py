@@ -51,6 +51,7 @@ from .const import (
     CLIMATE_DEVICE_TYPES,
     DEFAULT_WEEK_PROFILE,
     )
+from .climate_state import ClimateStateModel
 from .queue import CommandQueueManager, CommandResult, QueueEntry, QueueStopped
 
 from .protocol import (
@@ -223,17 +224,30 @@ class TemperatureIntent:
     temperature: float
     mode: int
     until: datetime | None
-    generation: int
     deadline: float
     entry: QueueEntry
     display_temperature: float | None
     configuration_task: asyncio.Future | None = None
     configuration_deadline: float | None = None
     task: asyncio.Task | None = None
-    overlay: bool = True
     command_status: str | None = None
     reported_fields: set[str] = field(default_factory=set)
-    reported_match: bool = False
+    retries_forbidden: bool = False
+    # Runtime lifecycle is independent of the historical delivery outcome.
+    closed: bool = False
+
+    @property
+    def overlay(self) -> bool:
+        """Derive preview visibility from delivery and report knowledge."""
+        if self.closed:
+            return False
+        status = self.command_status or self.entry.status
+        if status in {"acknowledged", "synchronized", "cancelled", "superseded"}:
+            return False
+        if status in {"failed", "unconfirmed"}:
+            return (self.entry.may_have_transmitted and not self.entry.delivery_rejected
+                    and not self.reported_fields & {"mode", "desired_temperature"})
+        return status != "completed"
 
 
 class _CommandRejected(ConnectionError):
@@ -456,7 +470,6 @@ class CulMaxCoordinator:
         self._command_queue.external_count = lambda: len(self._debounce_intents)
         self._config_jobs: dict[str, dict[str, Any]] = {}
         self._storage_lock = asyncio.Lock()
-        self._temperature_generation: dict[str, int] = {}
         self._command_worker_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
         self._cul_credit_lock = asyncio.Lock()
@@ -1020,9 +1033,9 @@ class CulMaxCoordinator:
         self._temperature_tasks.clear()
         self._debounce_intents.clear()
         for intent in self._desired_temperatures.values():
+            intent.closed = True
             if intent.entry.status not in {"completed", "failed", "cancelled", "superseded"}:
                 self._command_queue.finish(intent.entry, "cancelled")
-            intent.overlay = False
         self._queue_changed()
         self._reconnecting = False
         if self._reconnect_task:
@@ -1292,6 +1305,9 @@ class CulMaxCoordinator:
 
         last_error: Exception | None = None
         for attempt in range(1, request.retries + 2):
+            if request.temperature_intent and request.temperature_intent.retries_forbidden:
+                self._command_queue.finish(request.entry, "superseded")
+                raise QueueStopped("superseded")
             future: asyncio.Future[MaxMessage] = self.hass.loop.create_future()
             sent_at = 0.0
 
@@ -1304,7 +1320,6 @@ class CulMaxCoordinator:
                 sent_at = self.hass.loop.time()
                 if request.temperature_intent is not None:
                     request.temperature_intent.reported_fields.clear()
-                    request.temperature_intent.reported_match = False
                 self._pending_ack = PendingAck(
                     counter=request.counter,
                     expected_src=request.expected_src.upper() if request.expected_src else None,
@@ -1756,8 +1771,6 @@ class CulMaxCoordinator:
                 self._command_queue.finish(old, "superseded", notify=False)
         if len(self._command_queue.entries) + len(self._debounce_intents) >= self._command_queue.capacity:
             raise ValueError("Sendewarteschlange ist voll")
-        generation = self._temperature_generation.get(normalized, 0) + 1
-        self._temperature_generation[normalized] = generation
         future = self.hass.loop.create_future()
         # Accepted intents outlive a disconnected caller, but never leak exceptions.
         future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
@@ -1777,11 +1790,19 @@ class CulMaxCoordinator:
             display = (bytes.fromhex(validated.strip()[2:])[11] & 0x3F) / 2
         pending = self._pending_climate_tasks.get(normalized)
         intent = TemperatureIntent(
-            normalized, temperature, effective_mode, until, generation,
+            normalized, temperature, effective_mode, until,
             now + self._temperature_debounce_seconds, entry, display,
             configuration_task=pending if pending is not None and not pending.done() else None,
             configuration_deadline=now + 10.0,
         )
+        # Acceptance is the irreversible boundary for suppressing predecessor retries.
+        for queued in list(self._command_queue.entries.values()):
+            previous = getattr(queued.payload, "temperature_intent", None)
+            if previous is not None and previous.address == normalized:
+                previous.retries_forbidden = True
+                if queued.status == "retrying":
+                    self._command_queue.finish(queued, "superseded", notify=False)
+        self._radio_changed.set()
         self._debounce_intents[normalized] = intent
         self._desired_temperatures[normalized] = intent
         # Publish replacement as one complete state, with no intermediate rollback.
@@ -1799,7 +1820,7 @@ class CulMaxCoordinator:
         if self._debounce_intents.get(intent.address) is not intent:
             return
         self._debounce_intents.pop(intent.address)
-        intent.overlay = False
+
         self._command_queue.finish(intent.entry, status, notify=notify)
         if intent.task:
             intent.task.cancel()
@@ -1829,15 +1850,13 @@ class CulMaxCoordinator:
                 replace_key=intent.entry.replace_key, entry=intent.entry,
                 temperature_intent=intent,
             )
-            if result.status != "completed":
-                intent.overlay = False
-            elif (intent.mode == MODE_AUTO and intent.temperature <= 0 and intent.until is None
+            if (result.status == "completed" and intent.mode == MODE_AUTO and intent.temperature <= 0 and intent.until is None
                   and self._desired_temperatures.get(intent.address) is intent):
                 self._schedule_auto_mode_time_sync_followup(intent.address)
         except asyncio.CancelledError:
             if intent.entry.status not in {"completed", "failed", "cancelled", "superseded"}:
                 self._command_queue.finish(intent.entry, "cancelled")
-            intent.overlay = False
+
         except Exception as err:
             self._command_queue.finish(intent.entry, "failed", error=err)
             _LOGGER.warning("Temperature intent for %s %s: %s", intent.address,
@@ -1859,122 +1878,22 @@ class CulMaxCoordinator:
         return self._desired_temperatures.get(address.upper())
 
     def temperature_report_received(self, address: str, fields: set[str]) -> None:
-        """Reconcile only fields received after this intent's TCP handoff.
-
-        Receive order is the only available order for unsolicited state. Never
-        change the display merely because time passed, or trigger an RF retry.
-        """
-        intent = self.get_temperature_intent(address)
-        if intent and intent.entry.may_have_transmitted:
-            intent.reported_fields.update(fields)
-            device = self.get_device(address)
-            reported = device.last_state if device else {}
-            required = {"mode"}
-            if not (intent.mode in (MODE_AUTO, MODE_BOOST) and intent.temperature <= 0):
-                required.add("desired_temperature")
-            if intent.until is not None:
-                required.add("until")
-            intent.reported_match = (
-                required <= intent.reported_fields
-                and reported.get("mode") == intent.mode
-                and ("desired_temperature" not in required
-                     or reported.get("desired_temperature") == intent.display_temperature)
-                and ("until" not in required
-                     or reported.get("until") == intent.until.astimezone().strftime("%Y-%m-%d %H:%M"))
-            )
-            if intent.reported_match and intent.command_status in {"acknowledged", "unconfirmed"}:
-                intent.command_status = "synchronized"
-                intent.overlay = False
-            elif intent.command_status == "unconfirmed" and fields & {"mode", "desired_temperature"}:
-                intent.overlay = False
-        # Reports update entities even when the queue has not changed.
+        ClimateStateModel(self.get_device(address), self.get_temperature_intent(address)).report_received(fields)
         self._notify_temperature_updated(address)
 
     def _acknowledge_temperature_intent(self, intent: TemperatureIntent) -> None:
-        """Keep accepted settings separately from actual reports, without a timer.
-
-        Even a predecessor's ACK updates the fallback for a newer pending wish.
-        No reported values are fabricated or persisted from command acceptance.
-        """
-        device = self.get_device(intent.address)
-        if device is None:
-            return
-        if intent.reported_match:
-            intent.command_status = "synchronized"
-        else:
-            intent.command_status = "acknowledged"
-            accepted = {"mode": intent.mode,
-                        "until": intent.until.astimezone().strftime("%Y-%m-%d %H:%M") if intent.until else None}
-            if not (intent.mode in (MODE_AUTO, MODE_BOOST) and intent.temperature <= 0):
-                accepted["desired_temperature"] = intent.display_temperature
-            else:
-                # Auto/boost without a target makes no claim about its new target.
-                device.acknowledged_state.pop("desired_temperature", None)
-            device.acknowledged_state.update(accepted)
-            intent.reported_fields.clear()
-        if intent.display_temperature is not None and intent.temperature > TEMP_MIN:
-            device.last_normal_target = intent.display_temperature
-        intent.overlay = False
+        ClimateStateModel(self.get_device(intent.address), intent).acknowledge()
         self._notify_temperature_updated(intent.address)
 
     def _update_temperature_outcome(self, intent: TemperatureIntent) -> None:
-        """Queue status owns progress; only terminal outcomes need display detail."""
-        if intent.command_status is not None:
-            return
-        status = intent.entry.status
-        if status not in {"completed", "failed", "cancelled", "superseded"}:
-            return
-        if status == "completed":
-            intent.command_status = "acknowledged"
-        elif intent.entry.may_have_transmitted and not intent.entry.delivery_rejected:
-            intent.command_status = "unconfirmed"
-        else:
-            intent.command_status = status
-            intent.overlay = False
-            return
-        if intent.reported_match:
-            intent.command_status = "synchronized"
-            intent.overlay = False
-        elif intent.command_status == "unconfirmed" and intent.reported_fields & {"mode", "desired_temperature"}:
-            intent.overlay = False
+        ClimateStateModel(self.get_device(intent.address), intent).update_outcome()
 
     def _notify_temperature_updated(self, address: str) -> None:
         for listener in self._temperature_listeners.get(address.upper(), []):
             listener()
 
     def get_display_state(self, address: str) -> dict[str, Any]:
-        """Project reported state plus the latest complete user intent, without I/O."""
-        device = self.get_device(address)
-        reported = device.last_state if device else {}
-        accepted = device.acknowledged_state if device else {}
-        effective = {**reported, **accepted}
-        intent = self.get_temperature_intent(address)
-        desired = intent if intent and intent.overlay else None
-        mode = desired.mode if desired else effective.get("mode")
-        target = desired.display_temperature if desired else effective.get("desired_temperature")
-        preset = {MODE_BOOST: "boost", MODE_VACATION: "away"}.get(mode, "none")
-        hvac = {MODE_AUTO: "auto", MODE_MANUAL: "heat", MODE_BOOST: "heat",
-                MODE_VACATION: "heat"}.get(mode)
-        if mode == MODE_MANUAL and target == TEMP_MIN:
-            hvac = "off"
-        until = desired.until if desired else None
-        if desired is None and effective.get("until"):
-            try:
-                until = datetime.fromisoformat(effective["until"]).astimezone()
-            except (ValueError, TypeError):
-                pass
-        return {
-            "target_temperature": target, "current_temperature": reported.get("measured_temperature"),
-            "mode": mode, "hvac_mode": hvac, "preset_mode": preset, "hvac_action": None,
-            "until": until, "reported": dict(reported),
-            "requested_target_temperature": desired.display_temperature if desired else None,
-            "requested_mode": MODE_NAMES.get(desired.mode) if desired else None,
-            "reported_target_temperature": reported.get("desired_temperature"),
-            "reported_mode": MODE_NAMES.get(reported.get("mode")),
-            "command_status": (intent.command_status or intent.entry.status) if intent else
-                              "synchronized" if mode is not None else None,
-            "state_source": "requested" if desired else "acknowledged" if accepted else "reported",
-        }
+        return ClimateStateModel(self.get_device(address), self.get_temperature_intent(address)).display()
 
     def has_queue_entry(self, entry_id: str) -> bool:
         return entry_id in self._command_queue.entries or any(
@@ -4120,7 +4039,7 @@ class CulMaxCoordinator:
         for address, intent in self._desired_temperatures.items():
             self._update_temperature_outcome(intent)
             status = intent.command_status or intent.entry.status
-            state = (intent.generation, status, intent.overlay)
+            state = (intent.entry.id, status, intent.overlay)
             if self._temperature_published.get(address) != state:
                 self._temperature_published[address] = state
                 self._notify_temperature_updated(address)
@@ -4361,6 +4280,10 @@ class CulMaxCoordinator:
         def guard_write():
             if self._radio_acknowledged(request):
                 raise _RadioAcknowledged
+            previous = getattr(entry.payload, "temperature_intent", None)
+            if previous is not None and previous.retries_forbidden:
+                self._command_queue.finish(entry, "superseded")
+                raise QueueStopped("superseded")
             self._command_queue.before_write(entry)
             _LOGGER.debug("Queue: Sending %s %s", entry.command_type, entry.description)
             return before_send() if before_send else None
@@ -4419,6 +4342,12 @@ class CulMaxCoordinator:
             request = self._next_radio_request()
             if request is None:
                 return
+            previous = getattr(request.entry.payload, "temperature_intent", None)
+            if previous is not None and previous.retries_forbidden and not request.written:
+                self._command_queue.finish(request.entry, "superseded")
+                request.future.cancel()
+                self._radio_requests.remove(request)
+                continue
             # An ACK proves delivery even if the subsequent X barrier failed.
             # Keep the global budget paused, but do not retransmit that frame.
             if self._radio_acknowledged(request):

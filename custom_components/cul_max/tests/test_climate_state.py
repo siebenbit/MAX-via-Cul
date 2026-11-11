@@ -59,6 +59,107 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         self.cul.feed("Z" + bytes([len(body)]).hex() + body.hex())
         await self.settle()
 
+    async def test_targetless_mode_ack_clears_old_target_even_after_partial_match(self):
+        for mode in (mod.MODE_AUTO, mod.MODE_BOOST):
+            for report_first in (False, True):
+                with self.subTest(mode=mode, report_first=report_first):
+                    self.c.get_device("123456").device_type = mod.DEVICE_WALL_THERMOSTAT
+                    self.cul.credits = 900
+                    self.cul.frame_hook = lambda cul, cmd: cul.feed(transport.ack_line(cmd))
+                    await self.report(20, mode=1)
+                    await self.complete(22)
+                    self.cul.frame_hook = None
+                    task = self.request(0, mode=mode)
+                    await self.settle()
+                    await self.advance(2.01)
+                    if report_first:
+                        await self.feed_packet(0x40, bytes([mode << 6]))
+                    self.cul.feed(transport.ack_line(self.cul.frames[-1]))
+                    await asyncio.wait_for(task, .5)
+                    self.assertNotIn("desired_temperature", self.c.get_device("123456").acknowledged_state)
+                    self.assertEqual(self.display()["target_temperature"], 20)
+                    self.assertEqual(self.display()["mode"], mode)
+
+    async def test_overridden_inflight_attempt_never_retries_after_successor_deleted(self):
+        self.cul.frame_hook = None
+        with patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .04):
+            old = self.request(22)
+            await self.settle()
+            await self.advance(2.01)
+            newer = self.request(24)
+            await self.settle()
+            await self.report(18, mode=1)
+            self.c.clear_queue()
+            await newer
+            self.assertEqual((await asyncio.wait_for(old, .5)).status, "superseded")
+            self.assertEqual(len(self.cul.frames), 1)
+            self.assertEqual(self.display()["target_temperature"], 18)
+
+    async def test_overridden_retry_waiting_for_credits_is_removed(self):
+        self.cul.frame_hook = lambda cul, cmd: setattr(cul, "credits", 0)
+        with patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
+            old = self.request(22)
+            await self.settle()
+            await self.advance(2.01)
+            async def retry_waiting():
+                while self.c.get_temperature_intent("123456").entry.status != "retrying":
+                    await asyncio.sleep(.001)
+            await asyncio.wait_for(retry_waiting(), .5)
+            newer = self.request(24)
+            await self.settle()
+            self.assertEqual((await asyncio.wait_for(old, .5)).status, "superseded")
+            self.c.clear_queue()
+            await newer
+            self.cul.credits = 900
+            await self.advance(30)
+            self.assertEqual(len(self.cul.frames), 1)
+
+    async def test_overridden_retry_cannot_write_after_lock_release(self):
+        self.cul.frame_hook = None
+        with patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
+            old = self.request(22)
+            await self.settle()
+            await self.advance(2.01)
+            await self.c._send_lock.acquire()
+            try:
+                await asyncio.sleep(.025)
+                newer = self.request(24)
+                await self.settle()
+                self.c.clear_queue()
+                await newer
+            finally:
+                self.c._send_lock.release()
+            self.assertEqual((await asyncio.wait_for(old, .5)).status, "superseded")
+            await self.settle()
+            self.assertEqual(len(self.cul.frames), 1)
+
+    async def test_invalid_successor_does_not_disable_existing_retries(self):
+        self.cul.frame_hook = None
+        with patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .02):
+            old = self.request(22)
+            await self.settle()
+            await self.advance(2.01)
+            with self.assertRaises(ValueError):
+                await self.c.async_set_temperature("123456", float("nan"))
+            self.assertFalse(self.c.get_temperature_intent("123456").retries_forbidden)
+            self.cul.frame_hook = lambda cul, cmd: cul.feed(transport.ack_line(cmd))
+            self.assertEqual((await asyncio.wait_for(old, .5)).status, "completed")
+            self.assertEqual(len(self.cul.frames), 2)
+
+    async def test_overridden_lovf_attempt_does_not_wait_for_budget_or_send_again(self):
+        self.cul.reject = True
+        old = self.request(22)
+        await self.settle()
+        await self.advance(2.01)
+        newer = self.request(24)
+        await self.settle()
+        self.assertEqual((await asyncio.wait_for(old, .5)).status, "superseded")
+        self.c.clear_queue()
+        await newer
+        self.cul.reject = False
+        await self.advance(30)
+        self.assertFalse(self.cul.frames)
+
     async def test_off_manual_uses_confirmed_return_target_or_twenty(self):
         entity = await self.entity()
         for remembered, expected in ((None, 20), (23, 23)):
@@ -680,6 +781,33 @@ class ClimateStateTests(unittest.IsolatedAsyncioTestCase):
         await self.c.async_shutdown()
         self.assertFalse(intent.overlay)
         self.assertFalse(self.c._temperature_tasks)
+
+    async def test_shutdown_releases_unconfirmed_preview_without_changing_delivery_history(self):
+        entity = await self.entity()
+        reported = dict(self.c.get_device("123456").last_state)
+        self.cul.frame_hook = None
+        with patch.object(mod, "SET_TEMPERATURE_ACK_RETRIES", 0), patch.object(mod, "SET_TEMPERATURE_ACK_TIMEOUT", .01):
+            task = self.request(25)
+            await self.settle()
+            await self.advance(2.01)
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), .5)
+        self.assertIsInstance(result[0], ConnectionError)
+        intent = self.c.get_temperature_intent("123456")
+        self.assertTrue(intent.overlay)
+        self.assert_display(entity, 25, "heat")
+        frame_count = len(self.cul.frames)
+        await self.c.async_shutdown()
+        self.assertFalse(intent.overlay)
+        self.assertEqual(self.display()["command_status"], "unconfirmed")
+        self.assertEqual(self.display()["state_source"], "reported")
+        self.assertIsNone(self.display()["requested_target_temperature"])
+        self.assert_display(entity, 20, "heat")
+        self.assertEqual(self.c.get_device("123456").last_state, reported)
+        self.assertFalse(self.c._temperature_tasks)
+        self.assertEqual(len(self.cul.frames), frame_count)
+        await self.c.async_shutdown()
+        self.assertFalse(intent.overlay)
+        self.assertEqual(self.display()["command_status"], "unconfirmed")
 
     async def test_restart_restores_reported_state_only_not_optimistic_or_ack_state(self):
         await self.complete()

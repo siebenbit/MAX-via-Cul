@@ -1409,3 +1409,17 @@ Eingebettete ACK-Zustände werden nur bei einem positiven ACK übernommen, das z
 aktiven Anfrage einschließlich Absender, Empfänger, Nachrichtenzähler und Frist
 passt. Verspätete, doppelte oder unzuordenbare ACKs verändern die Anzeige nicht.
 Eigenständige Statusmeldungen werden weiterhin unabhängig davon verarbeitet.
+
+### Gleichzeitige Sollwertänderungen
+
+Ein neuer angenommener HA-Sollwert ersetzt noch nicht gesendete Vorgänger und
+verhindert weitere Wiederholungen bereits übergebener Vorgänger. Ein laufender
+Versuch darf noch innerhalb seines ACK-Zeitfensters bestätigt werden. Auch wenn
+der neue Wunsch gelöscht wird, werden alte Wiederholungen nicht wieder aktiviert.
+Automatik und Boost ohne expliziten Sollwert entfernen bei Bestätigung einen
+älteren ACK-Sollwert; die zuletzt gemeldete Temperatur bleibt als Rückfallwert.
+
+Ein passendes ACK behält Vorrang vor widersprechenden Meldungen zwischen Versand
+und ACK. ACK-Wissen bleibt im Arbeitsspeicher; nach einem Neustart korrigieren
+Gerätemeldungen die enthaltenen Felder. Statusattribute beschreiben den letzten
+HA-Auftrag, nicht zwingend die aktuelle Übereinstimmung mit dem Gerät.

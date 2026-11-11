@@ -1010,3 +1010,16 @@ Embedded ACK state is accepted only for a positive ACK matching the active
 transaction, including source, destination, counter and deadline. Late, duplicate
 or unrelated ACKs cannot change the display. Unsolicited state reports remain
 independent of command ACK matching.
+
+### Concurrent target changes
+
+A newly accepted HA target replaces unsent predecessors and prevents further
+retransmissions of predecessors already handed off. An ongoing attempt may still
+be acknowledged within its ACK window. Deleting the new request does not resume
+old retries. Confirming auto or boost without an explicit target removes an older
+ACK target; the last reported temperature remains the fallback.
+
+A matching ACK retains priority over conflicting reports received between handoff
+and ACK. ACK knowledge remains in memory; after restart, device reports correct
+the fields they contain. Status attributes describe the last HA request, not
+necessarily its current agreement with the device.
