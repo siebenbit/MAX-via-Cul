@@ -33,6 +33,8 @@ from .coordinator import CulMaxCoordinator
 from .frontend import async_register_frontend
 from .queue_api import CONTROLLERS, SERVICES as QUEUE_SERVICES, register_queue_services
 from .pairing_api import DATA_KEY as PAIRING_DATA_KEY, register_pairing_api
+from .room_association_api import register_room_association_api
+from .room_association import DATA_KEY as ASSOCIATION_DATA_KEY
 from .room_config_api import DATA_KEY as ROOM_DATA_KEY, SERVICES as ROOM_SERVICES, register_room_config_api
 
 _LOGGER = logging.getLogger(__name__)
@@ -326,6 +328,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bo
     _register_services(hass, coordinator)
     register_room_config_api(hass)
     register_pairing_api(hass)
+    await register_room_association_api(hass, entry.entry_id)
     return True
 
 
@@ -1431,12 +1434,16 @@ def _register_services(hass: HomeAssistant, coordinator: CulMaxCoordinator) -> N
 async def async_unload_entry(hass: HomeAssistant, entry: CulMaxConfigEntry) -> bool:
     """Unload the config entry and close serial connection."""
     coordinator: CulMaxCoordinator = entry.runtime_data
+    if ASSOCIATION_DATA_KEY in hass.data:
+        await hass.data[ASSOCIATION_DATA_KEY].manager.unload(entry.entry_id)
     await coordinator.async_shutdown()
     hass.data.get(CONTROLLERS, {}).pop(entry.entry_id, None)
     if PAIRING_DATA_KEY in hass.data:
         hass.data[PAIRING_DATA_KEY].rebind()
     if ROOM_DATA_KEY in hass.data:
         hass.data[ROOM_DATA_KEY].rebind()
+    if ASSOCIATION_DATA_KEY in hass.data:
+        hass.data[ASSOCIATION_DATA_KEY].rebind()
     if not hass.data.get(CONTROLLERS):
         for service_name in (*QUEUE_SERVICES, *ROOM_SERVICES):
             hass.services.async_remove(DOMAIN, service_name)

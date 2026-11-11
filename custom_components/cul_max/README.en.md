@@ -1091,3 +1091,24 @@ After 60 seconds without TCP reception, the integration probes the connection
 with an `X` credit query. If no reply arrives within three seconds, it reconnects.
 The probe sends no RF packets. Missed window events cannot be reconstructed;
 a new device report is needed to update the contact state.
+
+### Room association card
+
+The **MAX! Raumverknüpfung** card links the thermostats and physical window
+contacts in an existing HA area. Select the CUL and area, then start linking.
+
+```yaml
+type: custom:cul-max-room-association-card
+```
+
+Optional settings: `title` and `config_entry_id`. A visual editor is available.
+Administrator access is required. The integration stores a group ID per CUL and
+HA area. Existing unambiguous groups are adopted; conflicts allocate a free ID.
+External device links must be resolved manually before starting. While linking
+or waiting for window-contact commands, another start is blocked. Activate the
+contacts by opening/closing the window; a device duty-cycle pause must expire.
+Retries retain the assigned group and add only missing steps. Deferred contact
+commands can be cancelled through the queue card. After restart, existing deferred
+commands resume, while steps not yet queued require another explicit start.
+No HA areas are created, devices renamed or old links removed automatically.
+Changing an HA area alone does not reconfigure the physical devices.

@@ -1502,3 +1502,31 @@ Nach 60 Sekunden ohne TCP-Empfang prueft die Integration die Verbindung mit eine
 `X`-Budgetabfrage. Bleibt die Antwort drei Sekunden lang aus, wird die Verbindung
 neu aufgebaut. Die Pruefung sendet keine Funkpakete. Verpasste Fenstermeldungen
 werden nicht nachtraeglich rekonstruiert; dafuer ist eine neue Geraetemeldung noetig.
+
+### Karte zur Raumverknüpfung
+
+Die Karte **MAX! Raumverknüpfung** verbindet die Thermostate und physischen
+Fensterkontakte eines vorhandenen HA-Raums. CUL und Raum auswählen und
+**Geräte verknüpfen** drücken. Gerätenamen und Raumzuordnung werden aus HA gelesen.
+
+```yaml
+type: custom:cul-max-room-association-card
+```
+
+Optional: `title` und `config_entry_id` (CUL fest vorgeben). Ein visueller Editor
+ist vorhanden. Die Karte ist für Administratoren vorgesehen.
+
+Die Integration speichert die MAX!-Gruppen-ID pro CUL und HA-Raum. Bestehende
+eindeutige Gruppen werden übernommen, sonst eine freie ID vergeben. Bestehende
+Verknüpfungen zu raumfremden Geräten müssen vorher bewusst bereinigt werden.
+Während der Einrichtung oder ausstehender Fensterkontaktbefehle ist der Start
+gesperrt. Fensterkontakte durch Öffnen/Schließen aktivieren; bei Duty-Cycle-Limit
+muss gewartet werden. Nach Teilfehlern ergänzt **Erneut versuchen** fehlende Schritte
+mit derselben Gruppen-ID. Ausstehende Kontaktbefehle können in der Wartelistenkarte
+abgebrochen werden. Nach einem Neustart werden vorhandene Kontaktbefehle fortgesetzt;
+noch nicht beauftragte Schritte benötigen einen erneuten Start in der Karte.
+
+Es werden keine HA-Räume angelegt, keine Geräte umbenannt und keine bestehenden
+Links automatisch entfernt. Raumwechsel eines Geräts löst keine Funkänderung aus.
+Die Gruppen-ID bezeichnet die gespeicherte Zielzuordnung; der Status zeigt, ob die
+Einrichtung nach dem bekannten Integrationszustand vollständig ist.

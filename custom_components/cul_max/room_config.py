@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from homeassistant.util import dt as dt_util
 
-from .const import CLIMATE_DEVICE_TYPES, DOMAIN
+from .const import CLIMATE_DEVICE_TYPES, DEVICE_SHUTTER_CONTACT, DOMAIN
 from .protocol import (encode_week_profile, format_week_profile_by_day, order_week_profile_days, parse_max_temperature,
                        parse_week_profile_text, split_week_profile_for_send)
 
@@ -25,7 +25,7 @@ def fingerprint(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def registry_members(hass, controllers) -> list[dict]:
+def registry_members(hass, controllers, *, include_windows=False) -> list[dict]:
     """Honor entity area overrides; never infer rooms from names or RF groups."""
     from homeassistant.helpers import area_registry, device_registry, entity_registry
     areas = area_registry.async_get(hass)
@@ -33,7 +33,7 @@ def registry_members(hass, controllers) -> list[dict]:
     entities = entity_registry.async_get(hass)
     result = []
     for entity in entities.entities.values():
-        if entity.platform != DOMAIN or entity.domain != "climate":
+        if entity.platform != DOMAIN or entity.domain not in ({"climate", "binary_sensor"} if include_windows else {"climate"}):
             continue
         coordinator = controllers.get(entity.config_entry_id)
         if coordinator is None:
@@ -44,8 +44,10 @@ def registry_members(hass, controllers) -> list[dict]:
         if area is None:
             continue
         for device in coordinator.get_all_devices():
-            if (entity.unique_id == f"{DOMAIN}_{device.address}" and device.device_type in CLIMATE_DEVICE_TYPES
-                    and not device.superseded_by):
+            is_climate = entity.unique_id == f"{DOMAIN}_{device.address}" and device.device_type in CLIMATE_DEVICE_TYPES
+            is_window = (include_windows and entity.unique_id == f"{DOMAIN}_{device.address}_contact"
+                         and device.device_type == DEVICE_SHUTTER_CONTACT and not device.is_virtual)
+            if (is_climate or is_window) and not device.superseded_by:
                 result.append({"area_id": area.id, "area_name": area.name,
                                "config_entry_id": entity.config_entry_id, "address": device.address})
     return result

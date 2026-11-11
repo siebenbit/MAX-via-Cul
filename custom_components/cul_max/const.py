@@ -14,6 +14,8 @@ with _MANIFEST_PATH.open(encoding="utf-8") as manifest_file:
     INTEGRATION_VERSION = json.load(manifest_file).get("version", "0.0.0")
 
 FRONTEND_MODULES = [
+    {"name": "CUL MAX Room Association", "filename": "cul-max-room-association-card.js",
+     "version": INTEGRATION_VERSION, "legacy_paths": []},
     {"name": "CUL MAX Pairing", "filename": "cul-max-pairing-card.js",
      "version": INTEGRATION_VERSION, "legacy_paths": []},
     {"name": "CUL MAX Room Configuration", "filename": "cul-max-room-config-card.js",

@@ -1,0 +1,10 @@
+<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+body{font:16px system-ui;background:#eee;margin:24px}cul-max-room-association-card{display:block;max-width:650px;margin:auto}body.dark{--primary-text-color:#eee;--secondary-text-color:#aaa;--card-background-color:#202020;--ha-card-background:#202020;--divider-color:#555;--secondary-background-color:#333;background:#111}
+</style><cul-max-room-association-card></cul-max-room-association-card><script type="module">
+import '../../frontend/cul-max-room-association-card.js?v=fixture';
+window.room={id:'living',name:'Wohnzimmer',status:'new',group_id:null,busy:false,can_start:true,problems:[],devices:[{address:'123456',name:'Heizkörperthermostat mit einem langen vollständigen Gerätenamen',type:'Heizkörperthermostat',group_id:0},{address:'234567',name:'Fensterkontakt Balkon',type:'Fensterkontakt',group_id:0}],other_devices:['Wandthermostat am anderen CUL']};
+window.fixture={controllers:[{config_entry_id:'demo',name:'MAX! CUL',rooms:[room]}]};
+window.card=document.querySelector('cul-max-room-association-card');card.setConfig({});
+window.pushFixture=()=>window.push?.(structuredClone(fixture));
+card.hass={user:{is_admin:true},connection:{addEventListener(){},removeEventListener(){},async subscribeMessage(cb){window.push=cb;pushFixture();return()=>{};}},async callWS(msg){window.lastRequest=msg;if(window.failStart)throw Error('Speichern fehlgeschlagen');room.status='pending_activity';room.group_id=5;room.busy=true;room.can_start=false;room.devices[1].pending=true;pushFixture();return{status:'accepted',group_id:5};}};
+</script></html>

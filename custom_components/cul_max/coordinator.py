@@ -2818,8 +2818,14 @@ class CulMaxCoordinator:
         )
         return CommandResult("completed")
 
+    def _ensure_association_available(self, address: str) -> None:
+        hub = getattr(self.hass, "data", {}).get(f"{DOMAIN}_room_associations")
+        if hub:
+            hub.manager.ensure_available(self, address)
+
     async def async_set_group_id(self, address: str, group_id: int) -> None:
         """Assign a MAX! group ID to one device."""
+        self._ensure_association_available(address)
         device = self.get_device(address)
         if device is None:
             raise ValueError(f"Unbekannte Geraeteadresse {address}")
@@ -2867,6 +2873,7 @@ class CulMaxCoordinator:
 
     async def async_remove_group_id(self, address: str) -> None:
         """Remove a MAX! group ID from one device."""
+        self._ensure_association_available(address)
         device = self.get_device(address)
         if device is None:
             raise ValueError(f"Unbekannte Geraeteadresse {address}")
@@ -2913,6 +2920,8 @@ class CulMaxCoordinator:
 
     async def async_add_link_partner(self, address: str, partner_address: str) -> None:
         """Link one MAX! device to another device on-device."""
+        self._ensure_association_available(address)
+        self._ensure_association_available(partner_address)
         device = self.get_device(address)
         partner = self.get_device(partner_address)
         if device is None:
@@ -2986,6 +2995,8 @@ class CulMaxCoordinator:
 
     async def async_remove_link_partner(self, address: str, partner_address: str) -> None:
         """Remove an on-device link between two MAX! devices."""
+        self._ensure_association_available(address)
+        self._ensure_association_available(partner_address)
         device = self.get_device(address)
         partner = self.get_device(partner_address)
         if device is None:
